@@ -1,0 +1,15 @@
+[Unit]
+Description=AI WA Bot Service
+After=network.target mongod.service
+
+[Service]
+Type=simple
+User=ubuntu01
+WorkingDirectory=/home/ubuntu01/ai-wa-bot
+EnvironmentFile=/home/ubuntu01/ai-wa-bot/.env
+ExecStart=/home/ubuntu01/ai-wa-bot/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8002 --workers 2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
