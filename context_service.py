@@ -31,7 +31,9 @@ async def get_shop_context(shop_id: str) -> dict | None:
     source = shop.get("source", "standalone")
 
     if source == "lapakin":
-        data = await _fetch_from_lapakin(shop_id)
+        # Pakai lapakin_shop_id untuk fetch ke Lapakin API
+        lapakin_shop_id = shop.get("lapakin_shop_id", shop_id)
+        data = await _fetch_from_lapakin(lapakin_shop_id)
     else:
         data = await _fetch_from_local_db(shop, shop_id)
 
