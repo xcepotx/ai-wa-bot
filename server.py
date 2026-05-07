@@ -67,6 +67,11 @@ async def on_startup():
     await db.bot_events.create_index("type")
     # Provider mock / provider adapter
     await db.provider_messages.create_index([("provider", 1), ("created_at", -1)])
+    # Provider credentials
+    await db.provider_credentials.create_index("shop_id", unique=True)
+    await db.provider_credentials.create_index([("provider", 1), ("status", 1)])
+    await db.provider_credentials.create_index([("enabled", 1), ("updated_at", -1)])
+
     await db.provider_messages.create_index([("provider", 1), ("shop_id", 1), ("created_at", -1)])
     await db.provider_messages.create_index([("provider", 1), ("direction", 1), ("status", 1)])
     await db.provider_messages.create_index([("provider", 1), ("shop_id", 1), ("provider_message_id", 1)], unique=True, sparse=True)

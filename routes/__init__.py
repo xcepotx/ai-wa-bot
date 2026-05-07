@@ -9,7 +9,9 @@ from routes.conversations import router as conversations_router
 from routes.admin import router as admin_router
 from routes.provider_readiness import router as provider_readiness_router
 from routes.provider_mock import router as provider_mock_router
+from routes.provider_credentials import router as provider_credentials_router
 ALL_ROUTERS = [
+    provider_credentials_router,
     provider_mock_router,
     provider_readiness_router,
     admin_router,
