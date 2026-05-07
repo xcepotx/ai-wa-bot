@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from deps import db, require_user, require_admin
 from context_service import get_shop_context
 from catalog_service import get_effective_products, get_catalog_source_info
+from shop_status_service import get_effective_shop_status
 
 try:
     from reply_rules import (
@@ -212,7 +213,13 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
     system_status = control.get("status", "on")
     whatsapp = _extract_shop_whatsapp(context, shop_doc)
     payment_text = _extract_payment_safe(context, payment_doc)
-    hours = _extract_hours_safe(context, profile_doc, bot_settings)
+    shop_status = await get_effective_shop_status(
+        shop_id,
+        context=context,
+        bot_settings=bot_settings,
+        profile_doc=profile_doc,
+    )
+    hours = shop_status.get("business_hours")
 
     fallback_message = bot_settings.get("fallback_message")
     handoff_keywords = bot_settings.get("handoff_keywords") or []
@@ -315,7 +322,11 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
         "Jam operasional tersedia",
         _truthy_text(hours),
         10,
-        "Sudah diisi" if _truthy_text(hours) else "Jam operasional belum diisi",
+        (
+            f"Sudah diisi dari {shop_status.get('source_label')} · "
+            f"status: {shop_status.get('status_label')} · "
+            f"{shop_status.get('business_hours')}"
+        ) if _truthy_text(hours) else "Jam operasional belum diisi",
         action_url="/dashboard/shop",
     )
 
@@ -376,6 +387,7 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
         "mode": mode,
         "enabled": enabled,
         "admin_disabled": admin_disabled,
+        "shop_status": shop_status,
         "checks": checks,
         "blockers": blockers,
         "missing": missing,

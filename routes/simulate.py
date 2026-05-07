@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from context_service import get_shop_context
 from catalog_service import enrich_context_with_effective_products
+from shop_status_service import enrich_context_with_shop_status
 from prompt_builder import build_system_prompt
 from deps import db, now_iso, new_id
 
@@ -55,6 +56,7 @@ async def simulate(data: SimulateIn):
 
     context = await _enrich_context_from_db(data.shop_id, context)
     context = await enrich_context_with_effective_products(data.shop_id, context)
+    context = await enrich_context_with_shop_status(data.shop_id, context)
 
     session_id = data.session_id or f"sim_{uuid.uuid4().hex[:8]}"
     now = now_iso()
