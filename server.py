@@ -77,6 +77,10 @@ async def on_startup():
     await db.provider_messages.create_index([("provider", 1), ("shop_id", 1), ("created_at", -1)])
     await db.provider_messages.create_index([("provider", 1), ("direction", 1), ("status", 1)])
     await db.provider_messages.create_index([("provider", 1), ("shop_id", 1), ("provider_message_id", 1)], unique=True, sparse=True)
+    await db.provider_messages.create_index([("provider", 1), ("shop_id", 1), ("direction", 1), ("created_at", -1)])
+    await db.provider_credentials.create_index([("provider", 1), ("phone_number_id", 1)])
+    await db.provider_credentials.create_index([("provider", 1), ("waba_id", 1)])
+
 
     await db.bot_events.create_index("event_id", unique=True, sparse=True)
     await db.bot_events.create_index([("type", 1), ("created_at", -1)])
