@@ -5,7 +5,9 @@ from .bot_settings import router as bot_settings_router
 from .simulate import router as simulate_router
 from .connect import router as connect_router
 
+from routes.conversations import router as conversations_router
 ALL_ROUTERS = [
+    conversations_router,
     auth_router,
     shops_router,
     faqs_router,

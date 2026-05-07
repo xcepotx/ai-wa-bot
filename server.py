@@ -51,8 +51,14 @@ async def on_startup():
     # Conversations
     await db.sessions.create_index("session_id", unique=True, sparse=True)
     await db.sessions.create_index("shop_id")
+    await db.sessions.create_index([("shop_id", 1), ("status", 1), ("updated_at", -1)])
+    await db.sessions.create_index([("shop_id", 1), ("updated_at", -1)])
+    await db.sessions.create_index("customer_phone")
+
     await db.messages.create_index("shop_id")
     await db.messages.create_index("session_id")
+    await db.messages.create_index([("session_id", 1), ("created_at", 1)])
+    await db.messages.create_index([("shop_id", 1), ("created_at", -1)])
 
 
 @app.on_event("shutdown")
