@@ -69,6 +69,8 @@ async def on_startup():
     await db.provider_messages.create_index([("provider", 1), ("created_at", -1)])
     # Provider credentials
     await db.provider_credentials.create_index("shop_id", unique=True)
+    await db.provider_credentials.create_index([("provider", 1), ("verify_token", 1)])
+
     await db.provider_credentials.create_index([("provider", 1), ("status", 1)])
     await db.provider_credentials.create_index([("enabled", 1), ("updated_at", -1)])
 

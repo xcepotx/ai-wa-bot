@@ -10,7 +10,9 @@ from routes.admin import router as admin_router
 from routes.provider_readiness import router as provider_readiness_router
 from routes.provider_mock import router as provider_mock_router
 from routes.provider_credentials import router as provider_credentials_router
+from routes.provider_meta import router as provider_meta_router
 ALL_ROUTERS = [
+    provider_meta_router,
     provider_credentials_router,
     provider_mock_router,
     provider_readiness_router,
