@@ -230,6 +230,25 @@ async def simulate(data: SimulateIn):
 
     response_ms = int((time.time() - t0) * 1000)
 
+    auto_reply_policy_result = None
+    try:
+        from safety_policy import evaluate_auto_reply_policy
+
+        auto_reply_policy_result = await evaluate_auto_reply_policy(
+            shop_id=data.shop_id,
+            session_id=session_id,
+            reply_result={
+                "intent": intent,
+                "confidence": confidence,
+                "handoff_required": handoff_required,
+            },
+            channel="simulator",
+            require_provider_ready=True,
+            write_event=False,
+        )
+    except Exception as e:
+        logger.warning("Auto-reply policy preview failed: %s", e)
+
     await _insert_message(
         session_id=session_id,
         shop_id=data.shop_id,
@@ -243,6 +262,7 @@ async def simulate(data: SimulateIn):
             "handoff_required": handoff_required,
             "response_ms": response_ms,
             "session_update": extra_session_update,
+            "auto_reply_policy": auto_reply_policy_result,
         },
     )
 

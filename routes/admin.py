@@ -641,3 +641,39 @@ async def admin_force_enable_shop(shop_id: str, data: ShopForceIn, request: Requ
     })
 
     return {"ok": True, "shop_id": shop_id, "admin_disabled": False}
+
+
+# ── Auto-reply Safety Policy ──────────────────────────────
+
+class PolicyEvaluateIn(BaseModel):
+    intent: Optional[str] = "general_inquiry"
+    confidence: Optional[str] = "medium"
+    handoff_required: bool = False
+    channel: Optional[str] = "whatsapp"
+    require_provider_ready: bool = True
+
+
+@router.post("/admin/shops/{shop_id}/policy-evaluate")
+async def admin_policy_evaluate(shop_id: str, data: PolicyEvaluateIn, request: Request):
+    await require_admin(request)
+
+    shop = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0})
+    if not shop:
+        raise HTTPException(status_code=404, detail="Shop tidak ditemukan")
+
+    from safety_policy import evaluate_auto_reply_policy
+
+    result = await evaluate_auto_reply_policy(
+        shop_id=shop_id,
+        session_id=None,
+        reply_result={
+            "intent": data.intent,
+            "confidence": data.confidence,
+            "handoff_required": data.handoff_required,
+        },
+        channel=data.channel or "whatsapp",
+        require_provider_ready=data.require_provider_ready,
+        write_event=True,
+    )
+
+    return result
