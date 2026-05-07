@@ -716,3 +716,575 @@ async def admin_meta_webhook_test(data: MetaWebhookTestIn, request: Request):
     )
 
     return result
+
+
+# ── Meta Outbound Sender ──────────────────────────────────
+# Manual sender for outbound provider_messages with status=pending_send.
+# Real sending is only performed when dry_run=False.
+
+import asyncio
+import json
+import urllib.request
+import urllib.error
+from provider_security import decrypt_secret
+from safety_policy import mark_auto_reply_sent
+
+
+class MetaSendPendingIn(BaseModel):
+    provider_message_id: str
+    dry_run: bool = True
+
+
+class MetaSendPendingBatchIn(BaseModel):
+    shop_id: Optional[str] = None
+    limit: int = 20
+    dry_run: bool = True
+
+
+def _graph_api_base_url() -> str:
+    return os.getenv("META_GRAPH_API_BASE", "https://graph.facebook.com").rstrip("/")
+
+
+def _graph_api_version() -> str:
+    return os.getenv("META_GRAPH_VERSION", "v23.0").strip().lstrip("/")
+
+
+def _post_json_sync(url: str, token: str, payload: dict, timeout: int = 30) -> dict:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+            return {
+                "ok": 200 <= res.status < 300,
+                "status_code": res.status,
+                "data": parsed,
+            }
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw}
+
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "data": parsed,
+        }
+
+
+def _extract_meta_message_id(response_data: dict) -> Optional[str]:
+    messages = response_data.get("messages") or []
+    if isinstance(messages, list) and messages:
+        msg_id = messages[0].get("id")
+        if msg_id:
+            return str(msg_id)
+    return None
+
+
+async def _load_meta_credential_or_400(shop_id: str, dry_run: bool) -> dict:
+    cred = await db.provider_credentials.find_one(
+        {
+            "shop_id": shop_id,
+            "provider": "meta_cloud",
+            "status": {"$ne": "disabled"},
+        },
+        {"_id": 0},
+    )
+
+    if not cred:
+        raise HTTPException(status_code=404, detail="Meta provider credential belum dikonfigurasi")
+
+    if not cred.get("phone_number_id"):
+        raise HTTPException(status_code=400, detail="phone_number_id belum diisi")
+
+    if not cred.get("access_token_encrypted"):
+        raise HTTPException(status_code=400, detail="access_token belum tersimpan")
+
+    if not dry_run and not cred.get("enabled"):
+        raise HTTPException(
+            status_code=400,
+            detail="Provider credential belum enabled. Aktifkan dulu sebelum kirim real."
+        )
+
+    return cred
+
+
+async def _find_pending_outbound_or_404(provider_message_id: str) -> dict:
+    doc = await db.provider_messages.find_one(
+        {
+            "provider": "meta_cloud",
+            "direction": "outbound",
+            "$or": [
+                {"provider_message_id": provider_message_id},
+                {"local_provider_message_id": provider_message_id},
+            ],
+        },
+        {"_id": 0},
+    )
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pending outbound message tidak ditemukan")
+
+    if doc.get("status") != "pending_send":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Message status bukan pending_send: {doc.get('status')}"
+        )
+
+    return doc
+
+
+async def _update_session_provider_status(session_id: str, shop_id: str, provider_status: str, reason: str = ""):
+    await db.sessions.update_one(
+        {"session_id": session_id, "shop_id": shop_id},
+        {
+            "$set": {
+                "provider_status": provider_status,
+                "provider_send_reason": reason,
+                "updated_at": now_iso(),
+            }
+        },
+    )
+
+
+async def _update_latest_bot_message_after_send(
+    session_id: str,
+    provider_status: str,
+    meta_message_id: Optional[str],
+    send_response: dict,
+):
+    msg = await db.messages.find_one(
+        {
+            "session_id": session_id,
+            "role": {"$in": ["bot", "system"]},
+        },
+        {"_id": 0, "message_id": 1, "metadata": 1},
+        sort=[("created_at", -1)],
+    )
+
+    if not msg:
+        return
+
+    metadata = msg.get("metadata") or {}
+    provider_meta = metadata.get("provider_meta") or {}
+    provider_meta.update({
+        "provider_status": provider_status,
+        "meta_message_id": meta_message_id,
+        "send_response": send_response,
+        "sent_checked_at": now_iso(),
+    })
+    metadata["provider_meta"] = provider_meta
+
+    await db.messages.update_one(
+        {"message_id": msg["message_id"]},
+        {"$set": {"metadata": metadata}},
+    )
+
+
+async def _send_pending_meta_message(provider_message_id: str, dry_run: bool = True) -> dict:
+    pending = await _find_pending_outbound_or_404(provider_message_id)
+    shop_id = pending["shop_id"]
+    session_id = pending["session_id"]
+
+    # Load credential without enforcing enabled here.
+    # Real-send production checks are centralized in _evaluate_meta_real_send_guard().
+    cred = await _load_meta_credential_or_400(shop_id, dry_run=True)
+
+    if not dry_run:
+        real_guard = await _evaluate_meta_real_send_guard(shop_id)
+        if not real_guard.get("allowed"):
+            await _write_event(
+                shop_id,
+                "provider.meta.real_send_blocked",
+                {
+                    "session_id": session_id,
+                    "local_provider_message_id": pending.get("provider_message_id"),
+                    "guard": real_guard,
+                },
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Real send diblokir oleh production guard.",
+                    "guard": real_guard,
+                },
+            )
+
+    to_phone = str(pending.get("customer_phone") or "").replace("+", "")
+    text = pending.get("text") or ""
+
+    if not to_phone:
+        raise HTTPException(status_code=400, detail="customer_phone kosong")
+
+    if not text:
+        raise HTTPException(status_code=400, detail="outbound text kosong")
+
+    phone_number_id = cred["phone_number_id"]
+    local_provider_message_id = pending["provider_message_id"]
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_phone,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": text,
+        },
+    }
+
+    if dry_run:
+        meta_message_id = f"wamid.dryrun.{uuid.uuid4().hex}"
+        send_response = {
+            "ok": True,
+            "status_code": 200,
+            "data": {
+                "dry_run": True,
+                "messaging_product": "whatsapp",
+                "contacts": [{"input": to_phone, "wa_id": to_phone}],
+                "messages": [{"id": meta_message_id}],
+            },
+        }
+        provider_status = "dry_run_sent"
+        event_type = "provider.meta.reply_dry_run_sent"
+    else:
+        access_token = decrypt_secret(cred.get("access_token_encrypted"))
+        url = f"{_graph_api_base_url()}/{_graph_api_version()}/{phone_number_id}/messages"
+
+        send_response = await asyncio.to_thread(_post_json_sync, url, access_token, payload)
+        meta_message_id = _extract_meta_message_id(send_response.get("data") or {})
+
+        if send_response.get("ok") and meta_message_id:
+            provider_status = "sent"
+            event_type = "provider.meta.reply_sent"
+        else:
+            provider_status = "send_failed"
+            event_type = "provider.meta.reply_send_failed"
+
+    update_set = {
+        "status": provider_status,
+        "send_payload": payload,
+        "send_response": send_response,
+        "sent_at": now_iso() if provider_status in {"sent", "dry_run_sent"} else None,
+        "updated_at": now_iso(),
+        "meta_message_id": meta_message_id,
+        "local_provider_message_id": local_provider_message_id,
+    }
+
+    # For real sends, replace provider_message_id with Meta wamid so status webhooks can match.
+    # For dry-run, keep local id stable and store fake wamid in meta_message_id only.
+    if provider_status == "sent" and meta_message_id:
+        update_set["provider_message_id"] = meta_message_id
+
+    await db.provider_messages.update_one(
+        {
+            "provider": "meta_cloud",
+            "direction": "outbound",
+            "provider_message_id": local_provider_message_id,
+        },
+        {"$set": update_set},
+    )
+
+    await _update_session_provider_status(
+        session_id=session_id,
+        shop_id=shop_id,
+        provider_status=provider_status,
+        reason="Meta outbound sender",
+    )
+
+    await _update_latest_bot_message_after_send(
+        session_id=session_id,
+        provider_status=provider_status,
+        meta_message_id=meta_message_id,
+        send_response=send_response,
+    )
+
+    if provider_status == "sent":
+        await mark_auto_reply_sent(shop_id, session_id)
+
+    await _write_event(
+        shop_id,
+        event_type,
+        {
+            "session_id": session_id,
+            "local_provider_message_id": local_provider_message_id,
+            "meta_message_id": meta_message_id,
+            "provider_status": provider_status,
+            "dry_run": dry_run,
+            "send_response": send_response,
+        },
+    )
+
+    return {
+        "ok": provider_status in {"sent", "dry_run_sent"},
+        "dry_run": dry_run,
+        "shop_id": shop_id,
+        "session_id": session_id,
+        "local_provider_message_id": local_provider_message_id,
+        "meta_message_id": meta_message_id,
+        "provider_status": provider_status,
+        "send_response": send_response,
+    }
+
+
+@router.get("/admin/provider/meta/pending")
+async def admin_meta_pending_messages(
+    request: Request,
+    shop_id: Optional[str] = None,
+    limit: int = 50,
+):
+    await require_admin(request)
+
+    query = {
+        "provider": "meta_cloud",
+        "direction": "outbound",
+        "status": "pending_send",
+    }
+
+    if shop_id:
+        query["shop_id"] = shop_id
+
+    items = await db.provider_messages.find(query, {"_id": 0}) \
+        .sort("created_at", -1) \
+        .limit(max(1, min(limit, 200))) \
+        .to_list(max(1, min(limit, 200)))
+
+    return {
+        "items": items,
+        "total": len(items),
+    }
+
+
+@router.post("/admin/provider/meta/send-pending")
+async def admin_meta_send_pending(data: MetaSendPendingIn, request: Request):
+    await require_admin(request)
+    return await _send_pending_meta_message(data.provider_message_id, dry_run=data.dry_run)
+
+
+@router.post("/admin/provider/meta/send-pending-batch")
+async def admin_meta_send_pending_batch(data: MetaSendPendingBatchIn, request: Request):
+    await require_admin(request)
+
+    query = {
+        "provider": "meta_cloud",
+        "direction": "outbound",
+        "status": "pending_send",
+    }
+
+    if data.shop_id:
+        query["shop_id"] = data.shop_id
+
+    limit = max(1, min(data.limit or 20, 100))
+
+    pending = await db.provider_messages.find(query, {"_id": 0}) \
+        .sort("created_at", 1) \
+        .limit(limit) \
+        .to_list(limit)
+
+    results = []
+
+    for item in pending:
+        try:
+            results.append(
+                await _send_pending_meta_message(
+                    item["provider_message_id"],
+                    dry_run=data.dry_run,
+                )
+            )
+        except Exception as e:
+            results.append({
+                "ok": False,
+                "provider_message_id": item.get("provider_message_id"),
+                "error": str(e),
+            })
+
+    return {
+        "ok": True,
+        "dry_run": data.dry_run,
+        "processed": len(results),
+        "results": results,
+    }
+
+
+# ── Real Send Production Guard ────────────────────────────
+
+def _server_real_send_enabled() -> bool:
+    value = os.getenv("META_REAL_SEND_ENABLED", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+async def _evaluate_meta_real_send_guard(shop_id: str) -> dict:
+    checks = []
+
+    def add(key: str, label: str, passed: bool, detail: str = "", blocking: bool = True):
+        checks.append({
+            "key": key,
+            "label": label,
+            "passed": bool(passed),
+            "detail": detail,
+            "blocking": bool(blocking),
+        })
+
+    server_enabled = _server_real_send_enabled()
+    add(
+        "server_real_send_enabled",
+        "Server mengizinkan Meta real send",
+        server_enabled,
+        "Set META_REAL_SEND_ENABLED=true untuk production real send.",
+    )
+
+    control = await db.system_settings.find_one(
+        {"key": "lapakin_asisten_control"},
+        {"_id": 0},
+    ) or {"status": "on"}
+
+    system_status = control.get("status", "on")
+    add(
+        "global_system_on",
+        "Global Lapakin Asisten ON",
+        system_status == "on",
+        f"status={system_status}",
+    )
+
+    shop = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0})
+    add(
+        "shop_exists",
+        "Shop ditemukan",
+        bool(shop),
+        shop.get("name") if shop else "Shop tidak ditemukan",
+    )
+
+    settings = await db.bot_settings.find_one({"shop_id": shop_id}, {"_id": 0}) or {}
+
+    admin_disabled = bool(settings.get("admin_disabled"))
+    add(
+        "shop_not_admin_disabled",
+        "Shop tidak disabled admin",
+        not admin_disabled,
+        settings.get("admin_disable_reason") or "",
+    )
+
+    bot_enabled = bool(settings.get("enabled"))
+    mode = settings.get("mode") or "off"
+    add(
+        "assistant_enabled",
+        "Lapakin Asisten aktif",
+        bot_enabled,
+        f"enabled={bot_enabled}, mode={mode}",
+    )
+
+    add(
+        "mode_auto_reply",
+        "Mode mengizinkan auto-reply",
+        mode in {"auto_reply", "auto_reply_with_handoff"},
+        f"mode={mode}",
+    )
+
+    try:
+        from routes.provider_readiness import calculate_provider_readiness
+        readiness = await calculate_provider_readiness(shop_id)
+        provider_ready = bool(readiness.get("provider_ready"))
+        add(
+            "provider_readiness_ready",
+            "Provider readiness ready",
+            provider_ready,
+            f"score={readiness.get('score')}/100, status={readiness.get('status')}",
+        )
+    except Exception as e:
+        add(
+            "provider_readiness_ready",
+            "Provider readiness ready",
+            False,
+            f"Gagal cek readiness: {e}",
+        )
+
+    cred = await db.provider_credentials.find_one(
+        {
+            "shop_id": shop_id,
+            "provider": "meta_cloud",
+            "status": {"$ne": "disabled"},
+        },
+        {"_id": 0},
+    )
+
+    add(
+        "credential_exists",
+        "Meta credential tersedia",
+        bool(cred),
+        "credential found" if cred else "credential missing",
+    )
+
+    if cred:
+        add(
+            "credential_enabled",
+            "Credential enabled",
+            bool(cred.get("enabled")),
+            f"enabled={bool(cred.get('enabled'))}",
+        )
+
+        add(
+            "credential_connected",
+            "Credential status connected",
+            cred.get("status") == "connected",
+            f"status={cred.get('status')}",
+        )
+
+        add(
+            "phone_number_id_present",
+            "phone_number_id tersedia",
+            bool(cred.get("phone_number_id")),
+            cred.get("phone_number_id") or "missing",
+        )
+
+        add(
+            "access_token_present",
+            "Access token tersedia",
+            bool(cred.get("access_token_encrypted")),
+            "token present" if cred.get("access_token_encrypted") else "missing",
+        )
+
+    blockers = [c for c in checks if c["blocking"] and not c["passed"]]
+    allowed = len(blockers) == 0
+
+    return {
+        "allowed": allowed,
+        "shop_id": shop_id,
+        "checks": checks,
+        "blockers": blockers,
+        "message": (
+            "Real send diizinkan."
+            if allowed
+            else "Real send belum diizinkan. Selesaikan blocking checks dulu."
+        ),
+    }
+
+
+@router.get("/admin/provider/meta/real-send-guard")
+async def admin_meta_real_send_guard(request: Request, shop_id: str):
+    await require_admin(request)
+
+    guard = await _evaluate_meta_real_send_guard(shop_id)
+
+    await _write_event(
+        shop_id,
+        "provider.meta.real_send_guard_checked",
+        {
+            "allowed": guard.get("allowed"),
+            "blockers": guard.get("blockers"),
+        },
+    )
+
+    return guard
