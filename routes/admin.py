@@ -1,0 +1,431 @@
+"""Admin monitoring routes for AI WA Bot."""
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Request, Query
+from pydantic import BaseModel
+
+from deps import db, require_admin, now_iso, new_id
+
+router = APIRouter()
+
+
+class AdminNoteIn(BaseModel):
+    note: Optional[str] = None
+
+
+def _today_start_iso() -> str:
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.isoformat()
+
+
+async def _shop_map(shop_ids):
+    ids = [x for x in set(shop_ids) if x]
+    if not ids:
+        return {}
+
+    shops = await db.shops.find(
+        {"shop_id": {"$in": ids}},
+        {"_id": 0, "shop_id": 1, "name": 1, "source": 1, "owner_user_id": 1, "lapakin_shop_id": 1},
+    ).to_list(len(ids))
+
+    return {s["shop_id"]: s for s in shops}
+
+
+async def _settings_map(shop_ids):
+    ids = [x for x in set(shop_ids) if x]
+    if not ids:
+        return {}
+
+    rows = await db.bot_settings.find(
+        {"shop_id": {"$in": ids}},
+        {"_id": 0},
+    ).to_list(len(ids))
+
+    return {s["shop_id"]: s for s in rows}
+
+
+async def _session_counts_by_shop(shop_ids):
+    ids = [x for x in set(shop_ids) if x]
+    if not ids:
+        return {}
+
+    pipeline = [
+        {"$match": {"shop_id": {"$in": ids}}},
+        {"$group": {
+            "_id": "$shop_id",
+            "conversation_count": {"$sum": 1},
+            "handoff_count": {
+                "$sum": {
+                    "$cond": [
+                        {"$or": [
+                            {"$eq": ["$status", "handoff"]},
+                            {"$eq": ["$handoff_required", True]},
+                        ]},
+                        1,
+                        0,
+                    ]
+                }
+            },
+            "resolved_count": {
+                "$sum": {"$cond": [{"$eq": ["$status", "resolved"]}, 1, 0]}
+            },
+            "failed_count": {
+                "$sum": {"$cond": [{"$eq": ["$status", "failed"]}, 1, 0]}
+            },
+            "last_conversation_at": {"$max": "$updated_at"},
+        }},
+    ]
+
+    rows = await db.sessions.aggregate(pipeline).to_list(1000)
+    return {r["_id"]: r for r in rows}
+
+
+@router.get("/admin/overview")
+async def admin_overview(request: Request):
+    await require_admin(request)
+
+    today = _today_start_iso()
+
+    total_users = await db.users.count_documents({})
+    total_shops = await db.shops.count_documents({})
+    standalone_shops = await db.shops.count_documents({"source": "standalone"})
+    lapakin_shops = await db.shops.count_documents({"source": "lapakin"})
+
+    bot_enabled = await db.bot_settings.count_documents({"enabled": True})
+    auto_reply_active = await db.bot_settings.count_documents({
+        "enabled": True,
+        "mode": "auto_reply",
+    })
+    draft_only = await db.bot_settings.count_documents({
+        "enabled": True,
+        "mode": "draft_only",
+    })
+
+    total_sessions = await db.sessions.count_documents({})
+    messages_today = await db.messages.count_documents({"created_at": {"$gte": today}})
+    sessions_today = await db.sessions.count_documents({"created_at": {"$gte": today}})
+
+    handoff_pending = await db.sessions.count_documents({
+        "$or": [
+            {"status": "handoff"},
+            {"handoff_required": True},
+        ],
+        "status": {"$ne": "resolved"},
+    })
+
+    failed_conversations = await db.sessions.count_documents({"status": "failed"})
+
+    recent = await db.sessions.find({}, {"_id": 0}) \
+        .sort("updated_at", -1) \
+        .limit(10) \
+        .to_list(10)
+
+    shop_ids = [x.get("shop_id") for x in recent]
+    shops = await _shop_map(shop_ids)
+
+    recent_items = []
+    for item in recent:
+        shop = shops.get(item.get("shop_id"), {})
+        enriched = dict(item)
+        enriched["shop_name"] = shop.get("name")
+        enriched["shop_source"] = shop.get("source")
+        enriched["lapakin_shop_id"] = shop.get("lapakin_shop_id")
+        recent_items.append(enriched)
+
+    top_pipeline = [
+        {"$group": {
+            "_id": "$shop_id",
+            "conversation_count": {"$sum": 1},
+            "message_count": {"$sum": {"$ifNull": ["$message_count", 0]}},
+            "last_conversation_at": {"$max": "$updated_at"},
+        }},
+        {"$sort": {"conversation_count": -1}},
+        {"$limit": 10},
+    ]
+
+    top_rows = await db.sessions.aggregate(top_pipeline).to_list(10)
+    top_shop_ids = [x["_id"] for x in top_rows]
+    top_shops_map = await _shop_map(top_shop_ids)
+
+    top_shops = []
+    for row in top_rows:
+        shop = top_shops_map.get(row["_id"], {})
+        top_shops.append({
+            "shop_id": row["_id"],
+            "shop_name": shop.get("name") or row["_id"],
+            "shop_source": shop.get("source"),
+            "conversation_count": row.get("conversation_count", 0),
+            "message_count": row.get("message_count", 0),
+            "last_conversation_at": row.get("last_conversation_at"),
+        })
+
+    return {
+        "summary": {
+            "total_users": total_users,
+            "total_shops": total_shops,
+            "standalone_shops": standalone_shops,
+            "lapakin_shops": lapakin_shops,
+            "bot_enabled": bot_enabled,
+            "auto_reply_active": auto_reply_active,
+            "draft_only": draft_only,
+            "total_sessions": total_sessions,
+            "sessions_today": sessions_today,
+            "messages_today": messages_today,
+            "handoff_pending": handoff_pending,
+            "failed_conversations": failed_conversations,
+        },
+        "recent_conversations": recent_items,
+        "top_shops": top_shops,
+    }
+
+
+@router.get("/admin/shops")
+async def admin_shops(
+    request: Request,
+    source: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    skip: int = Query(0, ge=0),
+):
+    await require_admin(request)
+
+    query = {}
+
+    if source:
+        query["source"] = source
+
+    if q:
+        query["$or"] = [
+            {"name": {"$regex": q, "$options": "i"}},
+            {"shop_id": {"$regex": q, "$options": "i"}},
+            {"whatsapp": {"$regex": q, "$options": "i"}},
+            {"owner_email": {"$regex": q, "$options": "i"}},
+        ]
+
+    total = await db.shops.count_documents(query)
+
+    shops = await db.shops.find(query, {"_id": 0}) \
+        .sort("created_at", -1) \
+        .skip(skip) \
+        .limit(limit) \
+        .to_list(limit)
+
+    shop_ids = [s.get("shop_id") for s in shops]
+    settings = await _settings_map(shop_ids)
+    session_counts = await _session_counts_by_shop(shop_ids)
+
+    items = []
+
+    for shop in shops:
+        sid = shop.get("shop_id")
+        st = settings.get(sid, {})
+        cnt = session_counts.get(sid, {})
+
+        items.append({
+            "shop_id": sid,
+            "name": shop.get("name"),
+            "source": shop.get("source"),
+            "owner_user_id": shop.get("owner_user_id"),
+            "owner_email": shop.get("owner_email") or shop.get("email"),
+            "whatsapp": shop.get("whatsapp"),
+            "lapakin_shop_id": shop.get("lapakin_shop_id"),
+            "created_at": shop.get("created_at"),
+            "bot": {
+                "enabled": st.get("enabled", False),
+                "mode": st.get("mode", "off"),
+                "tone": st.get("tone"),
+                "quota_monthly": st.get("quota_monthly"),
+                "quota_used": st.get("quota_used"),
+                "last_simulated_at": st.get("last_simulated_at"),
+            },
+            "stats": {
+                "conversation_count": cnt.get("conversation_count", 0),
+                "handoff_count": cnt.get("handoff_count", 0),
+                "resolved_count": cnt.get("resolved_count", 0),
+                "failed_count": cnt.get("failed_count", 0),
+                "last_conversation_at": cnt.get("last_conversation_at"),
+            },
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "skip": skip,
+    }
+
+
+@router.get("/admin/conversations")
+async def admin_conversations(
+    request: Request,
+    status: Optional[str] = Query(None),
+    shop_id: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    skip: int = Query(0, ge=0),
+):
+    await require_admin(request)
+
+    query = {}
+
+    if status:
+        query["status"] = status
+
+    if shop_id:
+        query["shop_id"] = shop_id
+
+    if q:
+        query["$or"] = [
+            {"customer_name": {"$regex": q, "$options": "i"}},
+            {"customer_phone": {"$regex": q, "$options": "i"}},
+            {"last_message": {"$regex": q, "$options": "i"}},
+            {"last_reply": {"$regex": q, "$options": "i"}},
+            {"shop_id": {"$regex": q, "$options": "i"}},
+        ]
+
+    total = await db.sessions.count_documents(query)
+
+    sessions = await db.sessions.find(query, {"_id": 0}) \
+        .sort("updated_at", -1) \
+        .skip(skip) \
+        .limit(limit) \
+        .to_list(limit)
+
+    shop_ids = [x.get("shop_id") for x in sessions]
+    shops = await _shop_map(shop_ids)
+
+    items = []
+    for item in sessions:
+        shop = shops.get(item.get("shop_id"), {})
+        enriched = dict(item)
+        enriched["shop_name"] = shop.get("name")
+        enriched["shop_source"] = shop.get("source")
+        enriched["lapakin_shop_id"] = shop.get("lapakin_shop_id")
+        items.append(enriched)
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "skip": skip,
+    }
+
+
+@router.get("/admin/conversations/{session_id}")
+async def admin_conversation_detail(session_id: str, request: Request):
+    await require_admin(request)
+
+    session = await db.sessions.find_one({"session_id": session_id}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversation tidak ditemukan")
+
+    messages = await db.messages.find(
+        {"session_id": session_id},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(500)
+
+    shop = await db.shops.find_one(
+        {"shop_id": session.get("shop_id")},
+        {"_id": 0},
+    ) or {}
+
+    return {
+        "session": session,
+        "messages": messages,
+        "shop": shop,
+    }
+
+
+@router.post("/admin/conversations/{session_id}/handoff")
+async def admin_mark_handoff(session_id: str, data: AdminNoteIn, request: Request):
+    admin = await require_admin(request)
+    now = now_iso()
+
+    session = await db.sessions.find_one({"session_id": session_id}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversation tidak ditemukan")
+
+    result = await db.sessions.update_one(
+        {"session_id": session_id},
+        {
+            "$set": {
+                "status": "handoff",
+                "handoff_required": True,
+                "updated_at": now,
+            },
+            "$inc": {"message_count": 1},
+        },
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Conversation tidak ditemukan")
+
+    await db.messages.insert_one({
+        "message_id": new_id("msg"),
+        "session_id": session_id,
+        "shop_id": session.get("shop_id"),
+        "role": "system",
+        "channel": "admin_dashboard",
+        "text": data.note or "Admin menandai conversation perlu handoff.",
+        "intent": "admin_handoff_marked",
+        "confidence": None,
+        "source": "admin_action",
+        "metadata": {
+            "action": "admin_handoff",
+            "admin_user_id": admin.get("user_id"),
+            "admin_email": admin.get("email"),
+        },
+        "created_at": now,
+    })
+
+    return {"ok": True, "status": "handoff"}
+
+
+@router.post("/admin/conversations/{session_id}/resolve")
+async def admin_resolve(session_id: str, data: AdminNoteIn, request: Request):
+    admin = await require_admin(request)
+    now = now_iso()
+
+    session = await db.sessions.find_one({"session_id": session_id}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=404, detail="Conversation tidak ditemukan")
+
+    update_doc = {
+        "$set": {
+            "status": "resolved",
+            "handoff_required": False,
+            "resolved_at": now,
+            "updated_at": now,
+        }
+    }
+
+    if data.note:
+        update_doc["$inc"] = {"message_count": 1}
+
+    result = await db.sessions.update_one({"session_id": session_id}, update_doc)
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Conversation tidak ditemukan")
+
+    if data.note:
+        await db.messages.insert_one({
+            "message_id": new_id("msg"),
+            "session_id": session_id,
+            "shop_id": session.get("shop_id"),
+            "role": "system",
+            "channel": "admin_dashboard",
+            "text": data.note,
+            "intent": "admin_internal_note",
+            "confidence": None,
+            "source": "admin_note",
+            "metadata": {
+                "action": "admin_resolved",
+                "admin_user_id": admin.get("user_id"),
+                "admin_email": admin.get("email"),
+            },
+            "created_at": now,
+        })
+
+    return {"ok": True, "status": "resolved"}

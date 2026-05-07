@@ -6,7 +6,9 @@ from .simulate import router as simulate_router
 from .connect import router as connect_router
 
 from routes.conversations import router as conversations_router
+from routes.admin import router as admin_router
 ALL_ROUTERS = [
+    admin_router,
     conversations_router,
     auth_router,
     shops_router,
