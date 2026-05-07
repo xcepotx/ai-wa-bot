@@ -59,6 +59,11 @@ async def simulate(data: SimulateIn):
         now=now,
     )
 
+    session_doc = await db.sessions.find_one(
+        {"session_id": session_id, "shop_id": data.shop_id},
+        {"_id": 0},
+    ) or {}
+
     previous_history = await _build_recent_history(session_id, data.shop_id)
 
     await _insert_message(
@@ -79,6 +84,9 @@ async def simulate(data: SimulateIn):
         "fallback_message", "Maaf kak, silakan hubungi admin kami ya 🙏"
     )
 
+    if isinstance(handoff_kw, str):
+        handoff_kw = [x.strip() for x in handoff_kw.split(",") if x.strip()]
+
     msg_lower = data.customer_message.lower()
 
     bot_reply = ""
@@ -87,7 +95,9 @@ async def simulate(data: SimulateIn):
     source = "llm"
     handoff_required = False
     status = "bot_replied"
+    extra_session_update = {}
 
+    # 1. Hard handoff keyword.
     for kw in handoff_kw:
         if kw and kw.lower() in msg_lower:
             bot_reply = fallback_msg
@@ -98,6 +108,7 @@ async def simulate(data: SimulateIn):
             status = "handoff"
             break
 
+    # 2. FAQ exact/light match.
     if not bot_reply:
         faq_reply = _find_faq_match(data.customer_message, context.get("faqs", []))
         if faq_reply:
@@ -108,6 +119,29 @@ async def simulate(data: SimulateIn):
             handoff_required = False
             status = "bot_replied"
 
+    # 3. Deterministic commerce rules before LLM.
+    if not bot_reply:
+        try:
+            from reply_rules import build_rule_reply
+
+            rule = build_rule_reply(
+                data.customer_message,
+                context,
+                session_doc=session_doc,
+            )
+
+            if rule:
+                bot_reply = rule["reply"]
+                intent = rule.get("intent", "general_inquiry")
+                confidence = rule.get("confidence", "high")
+                source = rule.get("source", "rule")
+                handoff_required = bool(rule.get("handoff_required", False))
+                extra_session_update = rule.get("session_update") or {}
+                status = "handoff" if handoff_required else "bot_replied"
+        except Exception as e:
+            logger.exception("Rule reply error: %s", e)
+
+    # 4. LLM fallback.
     if not bot_reply:
         system_prompt = build_system_prompt(context)
         user_msg = (
@@ -148,6 +182,7 @@ async def simulate(data: SimulateIn):
         metadata={
             "handoff_required": handoff_required,
             "response_ms": response_ms,
+            "session_update": extra_session_update,
         },
     )
 
@@ -159,6 +194,7 @@ async def simulate(data: SimulateIn):
         intent=intent,
         status=status,
         handoff_required=handoff_required,
+        extra_set=extra_session_update,
     )
 
     await _mark_last_simulated(data.shop_id)
@@ -211,6 +247,7 @@ async def _ensure_session(
         "last_reply": None,
         "message_count": 0,
         "handoff_required": False,
+        "current_product": None,
         "created_at": now,
         "updated_at": now,
         "resolved_at": None,
@@ -253,20 +290,26 @@ async def _update_session_after_reply(
     intent: str,
     status: str,
     handoff_required: bool,
+    extra_set: Optional[dict] = None,
 ):
     now = now_iso()
+
+    set_doc = {
+        "status": status,
+        "last_intent": intent,
+        "last_message": customer_message,
+        "last_reply": bot_reply,
+        "handoff_required": handoff_required,
+        "updated_at": now,
+    }
+
+    if extra_set:
+        set_doc.update(extra_set)
 
     await db.sessions.update_one(
         {"session_id": session_id, "shop_id": shop_id},
         {
-            "$set": {
-                "status": status,
-                "last_intent": intent,
-                "last_message": customer_message,
-                "last_reply": bot_reply,
-                "handoff_required": handoff_required,
-                "updated_at": now,
-            },
+            "$set": set_doc,
             "$inc": {"message_count": 2},
         },
     )
