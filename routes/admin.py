@@ -677,3 +677,93 @@ async def admin_policy_evaluate(shop_id: str, data: PolicyEvaluateIn, request: R
     )
 
     return result
+
+
+# ── Bot Events / Admin Alerts ─────────────────────────────
+
+@router.get("/admin/events")
+async def admin_events(
+    request: Request,
+    type: Optional[str] = Query(None),
+    shop_id: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(80, ge=1, le=200),
+    skip: int = Query(0, ge=0),
+):
+    await require_admin(request)
+
+    query = {}
+
+    if type:
+        query["type"] = type
+
+    if shop_id:
+        query["shop_id"] = shop_id
+
+    if q:
+        query["$or"] = [
+            {"event_id": {"$regex": q, "$options": "i"}},
+            {"type": {"$regex": q, "$options": "i"}},
+            {"shop_id": {"$regex": q, "$options": "i"}},
+            {"payload.reason": {"$regex": q, "$options": "i"}},
+            {"payload.code": {"$regex": q, "$options": "i"}},
+            {"payload.status": {"$regex": q, "$options": "i"}},
+            {"payload.action": {"$regex": q, "$options": "i"}},
+            {"payload.admin_email": {"$regex": q, "$options": "i"}},
+        ]
+
+    total = await db.bot_events.count_documents(query)
+
+    rows = await db.bot_events.find(query, {"_id": 0}) \
+        .sort("created_at", -1) \
+        .skip(skip) \
+        .limit(limit) \
+        .to_list(limit)
+
+    shop_ids = [x.get("shop_id") for x in rows if x.get("shop_id")]
+    shops = await _shop_map(shop_ids)
+
+    items = []
+    for row in rows:
+        enriched = dict(row)
+        shop = shops.get(row.get("shop_id"), {})
+        enriched["shop_name"] = shop.get("name")
+        enriched["shop_source"] = shop.get("source")
+        items.append(enriched)
+
+    # lightweight type distribution for filters/overview
+    type_pipeline = [
+        {"$group": {"_id": "$type", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 30},
+    ]
+    type_rows = await db.bot_events.aggregate(type_pipeline).to_list(30)
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "skip": skip,
+        "event_types": [
+            {"type": x.get("_id") or "unknown", "count": x.get("count", 0)}
+            for x in type_rows
+        ],
+    }
+
+
+@router.get("/admin/events/{event_id}")
+async def admin_event_detail(event_id: str, request: Request):
+    await require_admin(request)
+
+    event = await db.bot_events.find_one({"event_id": event_id}, {"_id": 0})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event tidak ditemukan")
+
+    shop = {}
+    if event.get("shop_id"):
+        shop = await db.shops.find_one({"shop_id": event.get("shop_id")}, {"_id": 0}) or {}
+
+    return {
+        "event": event,
+        "shop": shop,
+    }

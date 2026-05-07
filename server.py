@@ -65,6 +65,9 @@ async def on_startup():
     await db.bot_events.create_index([("created_at", -1)])
     await db.bot_events.create_index([("shop_id", 1), ("created_at", -1)])
     await db.bot_events.create_index("type")
+    await db.bot_events.create_index("event_id", unique=True, sparse=True)
+    await db.bot_events.create_index([("type", 1), ("created_at", -1)])
+
     # Admin monitoring
     await db.sessions.create_index("status")
     await db.sessions.create_index([("status", 1), ("updated_at", -1)])
