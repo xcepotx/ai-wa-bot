@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from deps import db, require_user, require_admin
 from context_service import get_shop_context
+from catalog_service import get_effective_products, get_catalog_source_info
 
 try:
     from reply_rules import (
@@ -197,12 +198,8 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
             {"_id": 0},
         ).to_list(100)
 
-    products = _extract_products_safe(context)
-    if not products:
-        products = await db.products.find(
-            {"shop_id": shop_id},
-            {"_id": 0},
-        ).to_list(200)
+    catalog_source_info = await get_catalog_source_info(shop_id, context=context)
+    products = await get_effective_products(shop_id, context=context)
 
     active_products = [p for p in products if isinstance(p, dict) and _is_product_active(p)]
     products_with_price = [p for p in active_products if _product_price(p)]
@@ -277,7 +274,7 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
         "Minimal 3 produk aktif",
         len(active_products) >= 3,
         15,
-        f"{len(active_products)} produk aktif",
+        f"{len(active_products)} produk aktif dari {catalog_source_info.get('catalog_source_label')}",
         blocking=len(active_products) == 0,
         action_url="/dashboard/products",
     )
@@ -288,7 +285,7 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
         "Produk aktif punya harga",
         len(active_products) > 0 and len(products_with_price) == len(active_products),
         10,
-        f"{len(products_with_price)}/{len(active_products)} produk punya harga",
+        f"{len(products_with_price)}/{len(active_products)} produk punya harga · source: {catalog_source_info.get('catalog_source_label')}",
         action_url="/dashboard/products",
     )
 
