@@ -78,7 +78,7 @@ async def simulate(data: SimulateIn):
         metadata={},
     )
 
-    bot_settings = context.get("bot_settings", {})
+    bot_settings = await _load_fresh_bot_settings(data.shop_id, context)
     handoff_kw = bot_settings.get("handoff_keywords", [])
     fallback_msg = bot_settings.get(
         "fallback_message", "Maaf kak, silakan hubungi admin kami ya 🙏"
@@ -96,6 +96,66 @@ async def simulate(data: SimulateIn):
     handoff_required = False
     status = "bot_replied"
     extra_session_update = {}
+
+    safety_block = await _check_safety_block(data.shop_id, bot_settings)
+    if safety_block:
+        bot_reply = safety_block["reply"]
+        intent = safety_block["intent"]
+        confidence = "high"
+        source = "safety_policy"
+        handoff_required = False
+        status = "skipped"
+        response_ms = int((time.time() - t0) * 1000)
+
+        await _insert_message(
+            session_id=session_id,
+            shop_id=data.shop_id,
+            role="system",
+            channel="simulator",
+            text=bot_reply,
+            intent=intent,
+            confidence=confidence,
+            source=source,
+            metadata={
+                "reason": safety_block.get("reason"),
+                "status": safety_block.get("status"),
+                "response_ms": response_ms,
+            },
+        )
+
+        await _update_session_after_reply(
+            session_id=session_id,
+            shop_id=data.shop_id,
+            customer_message=data.customer_message,
+            bot_reply=bot_reply,
+            intent=intent,
+            status=status,
+            handoff_required=handoff_required,
+            extra_set={},
+        )
+
+        await _write_bot_event(
+            shop_id=data.shop_id,
+            event_type=safety_block["event_type"],
+            payload={
+                "session_id": session_id,
+                "reason": safety_block.get("reason"),
+                "system_status": safety_block.get("status"),
+            },
+        )
+
+        return SimulateOut(
+            session_id=session_id,
+            shop_id=data.shop_id,
+            customer_message=data.customer_message,
+            bot_reply=bot_reply,
+            intent=intent,
+            confidence=confidence,
+            handoff_required=handoff_required,
+            source=source,
+            status=status,
+            response_ms=response_ms,
+        )
 
     # 1. Hard handoff keyword.
     for kw in handoff_kw:
@@ -337,6 +397,81 @@ async def _build_recent_history(session_id: str, shop_id: str) -> str:
             lines.append(f"Bot: {text}")
 
     return "\n".join(lines) if lines else "-"
+
+
+async def _load_fresh_bot_settings(shop_id: str, context: dict) -> dict:
+    """Load bot settings directly from DB so admin safety changes are never stale.
+
+    get_shop_context() can include cached or external context. Safety controls like
+    admin_disabled must always read the latest local bot_settings document.
+    """
+    context_settings = context.get("bot_settings", {})
+    if not isinstance(context_settings, dict):
+        context_settings = {}
+
+    db_settings = await db.bot_settings.find_one(
+        {"shop_id": shop_id},
+        {"_id": 0},
+    ) or {}
+
+    # DB settings must override context settings because admin safety controls
+    # are written directly to db.bot_settings.
+    merged = {
+        **context_settings,
+        **db_settings,
+    }
+
+    return merged
+
+
+async def _check_safety_block(shop_id: str, bot_settings: dict) -> Optional[dict]:
+    control = await db.system_settings.find_one(
+        {"key": "lapakin_asisten_control"},
+        {"_id": 0},
+    ) or {}
+
+    status = control.get("status", "on")
+
+    if status != "on":
+        reason = control.get("reason") or "Sistem sedang tidak aktif."
+        label = "maintenance" if status == "maintenance" else "dinonaktifkan"
+
+        return {
+            "intent": "system_disabled",
+            "event_type": "reply.skipped_global_disabled",
+            "status": status,
+            "reason": reason,
+            "reply": (
+                f"Lapakin Asisten sedang {label} sementara oleh admin. "
+                f"Alasan: {reason}"
+            ),
+        }
+
+    if bot_settings.get("admin_disabled"):
+        reason = bot_settings.get("admin_disable_reason") or "Dinonaktifkan admin."
+
+        return {
+            "intent": "shop_admin_disabled",
+            "event_type": "reply.skipped_shop_disabled",
+            "status": "shop_disabled",
+            "reason": reason,
+            "reply": (
+                "Lapakin Asisten untuk toko ini sedang dinonaktifkan oleh admin. "
+                f"Alasan: {reason}"
+            ),
+        }
+
+    return None
+
+
+async def _write_bot_event(shop_id: str, event_type: str, payload: dict):
+    await db.bot_events.insert_one({
+        "event_id": new_id("evt"),
+        "shop_id": shop_id,
+        "type": event_type,
+        "payload": payload or {},
+        "created_at": now_iso(),
+    })
 
 
 async def _mark_last_simulated(shop_id: str):

@@ -59,6 +59,12 @@ async def on_startup():
     await db.messages.create_index("session_id")
     await db.messages.create_index([("session_id", 1), ("created_at", 1)])
     await db.messages.create_index([("shop_id", 1), ("created_at", -1)])
+
+    # Safety control / events
+    await db.system_settings.create_index("key", unique=True)
+    await db.bot_events.create_index([("created_at", -1)])
+    await db.bot_events.create_index([("shop_id", 1), ("created_at", -1)])
+    await db.bot_events.create_index("type")
     # Admin monitoring
     await db.sessions.create_index("status")
     await db.sessions.create_index([("status", 1), ("updated_at", -1)])

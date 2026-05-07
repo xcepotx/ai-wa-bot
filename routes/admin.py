@@ -239,6 +239,10 @@ async def admin_shops(
                 "quota_monthly": st.get("quota_monthly"),
                 "quota_used": st.get("quota_used"),
                 "last_simulated_at": st.get("last_simulated_at"),
+                "admin_disabled": st.get("admin_disabled", False),
+                "admin_disable_reason": st.get("admin_disable_reason"),
+                "admin_disabled_at": st.get("admin_disabled_at"),
+                "admin_disabled_by": st.get("admin_disabled_by"),
             },
             "stats": {
                 "conversation_count": cnt.get("conversation_count", 0),
@@ -429,3 +433,211 @@ async def admin_resolve(session_id: str, data: AdminNoteIn, request: Request):
         })
 
     return {"ok": True, "status": "resolved"}
+
+
+# ── Safety Control / Kill Switch ──────────────────────────
+
+class SystemStatusIn(BaseModel):
+    status: str
+    reason: Optional[str] = None
+
+
+class ShopForceIn(BaseModel):
+    reason: Optional[str] = None
+
+
+VALID_SYSTEM_STATUS = {"on", "maintenance", "off"}
+
+
+async def _get_system_control() -> dict:
+    doc = await db.system_settings.find_one(
+        {"key": "lapakin_asisten_control"},
+        {"_id": 0},
+    )
+
+    if not doc:
+        return {
+            "key": "lapakin_asisten_control",
+            "status": "on",
+            "reason": "",
+            "updated_at": None,
+            "updated_by": None,
+        }
+
+    return doc
+
+
+@router.get("/admin/system-status")
+async def admin_get_system_status(request: Request):
+    await require_admin(request)
+    control = await _get_system_control()
+
+    return {
+        "status": control.get("status", "on"),
+        "reason": control.get("reason", ""),
+        "updated_at": control.get("updated_at"),
+        "updated_by": control.get("updated_by"),
+        "auto_reply_allowed": control.get("status", "on") == "on",
+    }
+
+
+@router.put("/admin/system-status")
+async def admin_update_system_status(data: SystemStatusIn, request: Request):
+    admin = await require_admin(request)
+    status = (data.status or "").lower().strip()
+
+    if status not in VALID_SYSTEM_STATUS:
+        raise HTTPException(
+            status_code=400,
+            detail="Status tidak valid. Gunakan: on, maintenance, off."
+        )
+
+    if status != "on" and not data.reason:
+        raise HTTPException(
+            status_code=400,
+            detail="Reason wajib diisi saat maintenance/off."
+        )
+
+    now = now_iso()
+
+    await db.system_settings.update_one(
+        {"key": "lapakin_asisten_control"},
+        {
+            "$set": {
+                "key": "lapakin_asisten_control",
+                "status": status,
+                "reason": data.reason or "",
+                "updated_at": now,
+                "updated_by": admin.get("email") or admin.get("user_id"),
+            },
+            "$setOnInsert": {
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+    await db.bot_events.insert_one({
+        "event_id": new_id("evt"),
+        "shop_id": None,
+        "type": "system.status_updated",
+        "payload": {
+            "status": status,
+            "reason": data.reason or "",
+            "admin_user_id": admin.get("user_id"),
+            "admin_email": admin.get("email"),
+        },
+        "created_at": now,
+    })
+
+    return {
+        "ok": True,
+        "status": status,
+        "reason": data.reason or "",
+    }
+
+
+@router.post("/admin/shops/{shop_id}/force-disable")
+async def admin_force_disable_shop(shop_id: str, data: ShopForceIn, request: Request):
+    admin = await require_admin(request)
+
+    if not data.reason:
+        raise HTTPException(status_code=400, detail="Reason wajib diisi.")
+
+    shop = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0})
+    if not shop:
+        raise HTTPException(status_code=404, detail="Shop tidak ditemukan")
+
+    now = now_iso()
+
+    await db.bot_settings.update_one(
+        {"shop_id": shop_id},
+        {
+            "$set": {
+                "shop_id": shop_id,
+                "enabled": False,
+                "admin_disabled": True,
+                "admin_disable_reason": data.reason,
+                "admin_disabled_at": now,
+                "admin_disabled_by": admin.get("email") or admin.get("user_id"),
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "created_at": now,
+                "mode": "off",
+                "tone": "ramah",
+                "language": "id",
+                "quota_monthly": 100,
+                "quota_used": 0,
+            },
+        },
+        upsert=True,
+    )
+
+    await db.bot_events.insert_one({
+        "event_id": new_id("evt"),
+        "shop_id": shop_id,
+        "type": "shop.force_disabled",
+        "payload": {
+            "reason": data.reason,
+            "shop_name": shop.get("name"),
+            "admin_user_id": admin.get("user_id"),
+            "admin_email": admin.get("email"),
+        },
+        "created_at": now,
+    })
+
+    return {"ok": True, "shop_id": shop_id, "admin_disabled": True}
+
+
+@router.post("/admin/shops/{shop_id}/force-enable")
+async def admin_force_enable_shop(shop_id: str, data: ShopForceIn, request: Request):
+    admin = await require_admin(request)
+
+    shop = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0})
+    if not shop:
+        raise HTTPException(status_code=404, detail="Shop tidak ditemukan")
+
+    now = now_iso()
+
+    await db.bot_settings.update_one(
+        {"shop_id": shop_id},
+        {
+            "$set": {
+                "shop_id": shop_id,
+                "enabled": True,
+                "admin_disabled": False,
+                "admin_reenabled_at": now,
+                "admin_reenabled_by": admin.get("email") or admin.get("user_id"),
+                "admin_reenable_reason": data.reason or "",
+                "updated_at": now,
+            },
+            "$unset": {
+                "admin_disable_reason": "",
+            },
+            "$setOnInsert": {
+                "created_at": now,
+                "mode": "draft_only",
+                "tone": "ramah",
+                "language": "id",
+                "quota_monthly": 100,
+                "quota_used": 0,
+            },
+        },
+        upsert=True,
+    )
+
+    await db.bot_events.insert_one({
+        "event_id": new_id("evt"),
+        "shop_id": shop_id,
+        "type": "shop.force_enabled",
+        "payload": {
+            "reason": data.reason or "",
+            "shop_name": shop.get("name"),
+            "admin_user_id": admin.get("user_id"),
+            "admin_email": admin.get("email"),
+        },
+        "created_at": now,
+    })
+
+    return {"ok": True, "shop_id": shop_id, "admin_disabled": False}
