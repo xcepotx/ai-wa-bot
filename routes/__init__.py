@@ -7,7 +7,9 @@ from .connect import router as connect_router
 
 from routes.conversations import router as conversations_router
 from routes.admin import router as admin_router
+from routes.provider_readiness import router as provider_readiness_router
 ALL_ROUTERS = [
+    provider_readiness_router,
     admin_router,
     conversations_router,
     auth_router,
