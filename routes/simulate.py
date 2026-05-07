@@ -42,11 +42,17 @@ async def simulate(data: SimulateIn):
     t0 = time.time()
 
     context = await get_shop_context(data.shop_id)
+
     if not context:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Toko {data.shop_id} tidak ditemukan."
-        )
+        shop_exists = await db.shops.find_one({"shop_id": data.shop_id}, {"_id": 0, "shop_id": 1})
+        if not shop_exists:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Toko {data.shop_id} tidak ditemukan."
+            )
+        context = {}
+
+    context = await _enrich_context_from_db(data.shop_id, context)
 
     session_id = data.session_id or f"sim_{uuid.uuid4().hex[:8]}"
     now = now_iso()
@@ -417,6 +423,79 @@ async def _build_recent_history(session_id: str, shop_id: str) -> str:
             lines.append(f"Bot: {text}")
 
     return "\n".join(lines) if lines else "-"
+
+
+async def _enrich_context_from_db(shop_id: str, context: dict) -> dict:
+    """Merge local DB data into context so rule engine always has fresh shop data.
+
+    get_shop_context() may depend on standalone/Lapakin source behavior and may not
+    always include products, FAQs, payment info, or operational profile. Simulator and
+    provider adapter must still be able to answer from trusted local DB data.
+    """
+    if not isinstance(context, dict):
+        context = {}
+
+    enriched = dict(context)
+
+    shop_doc = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0}) or {}
+    if shop_doc:
+        existing_shop = enriched.get("shop") if isinstance(enriched.get("shop"), dict) else {}
+        enriched["shop"] = {**shop_doc, **existing_shop}
+
+        if not enriched.get("shop_name"):
+            enriched["shop_name"] = shop_doc.get("name")
+
+        if not enriched.get("whatsapp"):
+            enriched["whatsapp"] = shop_doc.get("whatsapp") or shop_doc.get("whatsapp_number")
+
+    # Products: always fallback to db.products when context does not include products.
+    products = enriched.get("products")
+    if not isinstance(products, list) or len(products) == 0:
+        db_products = await db.products.find(
+            {"shop_id": shop_id},
+            {"_id": 0},
+        ).to_list(300)
+
+        if db_products:
+            enriched["products"] = db_products
+
+    # FAQs: fallback to bot_faqs.
+    faqs = enriched.get("faqs")
+    if not isinstance(faqs, list) or len(faqs) == 0:
+        db_faqs = await db.bot_faqs.find(
+            {"shop_id": shop_id, "enabled": {"$ne": False}},
+            {"_id": 0},
+        ).to_list(100)
+
+        if db_faqs:
+            enriched["faqs"] = db_faqs
+
+    # Payment info.
+    payment_doc = await db.payment_info.find_one({"shop_id": shop_id}, {"_id": 0}) or {}
+    if payment_doc:
+        enriched["payment_info"] = payment_doc
+
+        payment_text = (
+            payment_doc.get("instruction")
+            or payment_doc.get("payment_instruction")
+            or payment_doc.get("description")
+        )
+
+        if payment_text and not enriched.get("payment_instruction"):
+            enriched["payment_instruction"] = payment_text
+
+    # Operational profile.
+    profile_doc = await db.bot_shop_profile.find_one({"shop_id": shop_id}, {"_id": 0}) or {}
+    if profile_doc:
+        enriched["bot_profile"] = profile_doc
+
+        if profile_doc.get("business_hours") and not enriched.get("business_hours"):
+            enriched["business_hours"] = profile_doc.get("business_hours")
+
+        if profile_doc.get("address") and not enriched.get("address"):
+            enriched["address"] = profile_doc.get("address")
+
+    return enriched
 
 
 async def _load_fresh_bot_settings(shop_id: str, context: dict) -> dict:
