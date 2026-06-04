@@ -1,10 +1,15 @@
 """Shop routes: CRUD toko, produk, payment info."""
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 from deps import db, require_user, new_id, now_iso
 from models import ShopIn, ProductIn, PaymentIn, BotProfileIn
 
 router = APIRouter()
+
+
+class ShopMenuSettingsIn(BaseModel):
+    show_manual_products: bool = True
 
 
 # ── Helper ────────────────────────────────────────────────
@@ -50,6 +55,7 @@ async def create_shop(data: ShopIn, request: Request):
         "hours":        data.hours or "",
         "about":        data.about or "",
         "is_active":    data.is_active,
+        "show_manual_products": getattr(data, "show_manual_products", True),
         "created_at":   now,
         "updated_at":   now,
     }
@@ -69,6 +75,7 @@ async def create_shop(data: ShopIn, request: Request):
 async def get_my_shop(request: Request):
     user = await require_user(request)
     shop = await _get_user_shop(user)
+    shop.setdefault("show_manual_products", True)
 
     # Enrich dengan data tambahan
     products = await db.products.find(
@@ -110,6 +117,31 @@ async def update_my_shop(data: ShopIn, request: Request):
     }
     await db.shops.update_one({"shop_id": shop["shop_id"]}, {"$set": update})
     return {"ok": True}
+
+
+@router.put("/shops/me/menu-settings")
+async def update_menu_settings(data: ShopMenuSettingsIn, request: Request):
+    user = await require_user(request)
+    shop = await _get_user_shop(user)
+    now = now_iso()
+
+    update = {
+        "show_manual_products": bool(data.show_manual_products),
+        "updated_at": now,
+    }
+
+    await db.shops.update_one(
+        {"shop_id": shop["shop_id"]},
+        {"$set": update},
+    )
+
+    updated_shop = await db.shops.find_one(
+        {"shop_id": shop["shop_id"]},
+        {"_id": 0},
+    )
+    updated_shop.setdefault("show_manual_products", True)
+
+    return {"ok": True, "shop": updated_shop}
 
 
 # ── Payment Info ──────────────────────────────────────────
