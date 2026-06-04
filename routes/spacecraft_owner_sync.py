@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 """Owner SpaceCraft product sync routes."""
 import os
 
@@ -26,6 +27,37 @@ async def _require_spacecraft_owner(request: Request) -> tuple[dict, str]:
         raise HTTPException(status_code=403, detail="Sync SpaceCraft hanya tersedia untuk toko SpaceCraft")
 
     return user, expected
+
+
+
+
+def _cc_clean_doc(doc):
+    if not doc:
+        return None
+    out = {}
+    for key, value in dict(doc).items():
+        if key == "_id":
+            continue
+        if isinstance(value, datetime):
+            out[key] = value.isoformat()
+        elif isinstance(value, dict):
+            out[key] = _cc_clean_doc(value)
+        elif isinstance(value, list):
+            out[key] = [_cc_clean_doc(v) if isinstance(v, dict) else v for v in value]
+        else:
+            out[key] = value
+    return out
+
+
+def _cc_parse_dt(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 @router.get("/spacecraft/sync-status")
@@ -244,5 +276,228 @@ async def owner_spacecraft_sync_history(
         "ok": True,
         "items": items,
         "total": len(items),
+    }
+
+
+@router.get("/spacecraft/command-center")
+async def owner_spacecraft_command_center(request: Request):
+    _, shop_id = await _require_spacecraft_owner(request)
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    since_7d = (now - timedelta(days=7)).isoformat()
+
+    product_base = {"shop_id": shop_id, "source": "spacecraft_api"}
+    no_price_query = {
+        **product_base,
+        "$or": [
+            {"price": None},
+            {"price": {"$exists": False}},
+            {"price": {"$lte": 0}},
+        ],
+    }
+    no_image_query = {
+        **product_base,
+        "$or": [
+            {"image_url": None},
+            {"image_url": ""},
+            {"image_url": {"$exists": False}},
+        ],
+    }
+
+    lead_base = {"shop_id": shop_id}
+    need_follow_statuses = ["new", "contact_requested", "notified"]
+
+    products_total = await db.products.count_documents(product_base)
+    products_active = await db.products.count_documents({**product_base, "status": "active"})
+    products_no_price = await db.products.count_documents(no_price_query)
+    products_no_image = await db.products.count_documents(no_image_query)
+
+    leads_total = await db.webchat_leads.count_documents(lead_base)
+    leads_today = await db.webchat_leads.count_documents({**lead_base, "created_at": {"$gte": today_start}})
+    leads_7d = await db.webchat_leads.count_documents({**lead_base, "created_at": {"$gte": since_7d}})
+    leads_need_follow_up = await db.webchat_leads.count_documents({
+        **lead_base,
+        "status": {"$in": need_follow_statuses},
+    })
+    leads_followed_up = await db.webchat_leads.count_documents({**lead_base, "status": "followed_up"})
+    leads_won = await db.webchat_leads.count_documents({**lead_base, "status": "won"})
+    leads_lost = await db.webchat_leads.count_documents({**lead_base, "status": "lost"})
+
+    sessions_total = await db.sessions.count_documents({"shop_id": shop_id})
+    messages_total = await db.messages.count_documents({"shop_id": shop_id})
+
+    shop = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0})
+    bot_settings = await db.bot_settings.find_one({"shop_id": shop_id}, {"_id": 0})
+
+    sync_types = [
+        "spacecraft.products_synced",
+        "spacecraft.products_sync_failed",
+        "owner.spacecraft.products_sync_triggered",
+    ]
+    latest_sync_event = await db.bot_events.find_one(
+        {"shop_id": shop_id, "type": {"$in": sync_types}},
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
+
+    latest_leads = await db.webchat_leads.find(
+        {"shop_id": shop_id},
+        {
+            "_id": 0,
+            "lead_id": 1,
+            "session_id": 1,
+            "status": 1,
+            "customer_name": 1,
+            "customer_phone": 1,
+            "need_summary": 1,
+            "last_message": 1,
+            "intent": 1,
+            "confidence": 1,
+            "reply_source": 1,
+            "created_at": 1,
+            "updated_at": 1,
+        },
+    ).sort("updated_at", -1).limit(6).to_list(6)
+
+    latest_events = await db.bot_events.find(
+        {"shop_id": shop_id},
+        {"_id": 0, "event_id": 1, "type": 1, "payload": 1, "created_at": 1},
+    ).sort("created_at", -1).limit(8).to_list(8)
+
+    latest_conversations = await db.sessions.find(
+        {"shop_id": shop_id},
+        {
+            "_id": 0,
+            "session_id": 1,
+            "source": 1,
+            "customer_name": 1,
+            "customer_phone": 1,
+            "status": 1,
+            "last_message": 1,
+            "updated_at": 1,
+            "created_at": 1,
+        },
+    ).sort("updated_at", -1).limit(5).to_list(5)
+
+    warnings = []
+
+    if not bot_settings or not bot_settings.get("enabled"):
+        warnings.append({
+            "type": "bot_off",
+            "level": "high",
+            "title": "Bot belum aktif",
+            "message": "Aktifkan bot agar pesan pelanggan bisa diproses otomatis.",
+            "action_label": "Buka Pengaturan Bot",
+            "action_to": "/dashboard/bot",
+        })
+
+    if bot_settings and bot_settings.get("mode") != "auto_reply":
+        warnings.append({
+            "type": "not_auto_reply",
+            "level": "medium",
+            "title": "Mode bot belum Balas Otomatis",
+            "message": f"Mode saat ini: {bot_settings.get('mode') or 'off'}.",
+            "action_label": "Buka Pengaturan Bot",
+            "action_to": "/dashboard/bot",
+        })
+
+    if leads_need_follow_up > 0:
+        warnings.append({
+            "type": "lead_follow_up",
+            "level": "high",
+            "title": f"{leads_need_follow_up} lead perlu follow-up",
+            "message": "Ada calon pembeli yang sudah menunjukkan minat tetapi belum selesai ditindaklanjuti.",
+            "action_label": "Buka Leads",
+            "action_to": "/dashboard/webchat-leads",
+        })
+
+    if products_no_price > 0:
+        warnings.append({
+            "type": "product_no_price",
+            "level": "medium",
+            "title": f"{products_no_price} produk perlu info harga",
+            "message": "Produk tanpa harga numeric akan dijawab sebagai harga perlu konfirmasi admin.",
+            "action_label": "Cek Produk SpaceCraft",
+            "action_to": "/dashboard/spacecraft-products",
+        })
+
+    if products_no_image > 0:
+        warnings.append({
+            "type": "product_no_image",
+            "level": "low",
+            "title": f"{products_no_image} produk tanpa gambar",
+            "message": "Lengkapi gambar agar katalog lebih siap untuk sales assistant.",
+            "action_label": "Cek Produk SpaceCraft",
+            "action_to": "/dashboard/spacecraft-products",
+        })
+
+    last_sync_at = None
+    last_sync_age_minutes = None
+    if latest_sync_event:
+        last_sync_at = latest_sync_event.get("created_at") or latest_sync_event.get("payload", {}).get("synced_at")
+        parsed = _cc_parse_dt(last_sync_at)
+        if parsed:
+            last_sync_age_minutes = round((now - parsed).total_seconds() / 60)
+
+    if not latest_sync_event:
+        warnings.append({
+            "type": "sync_missing",
+            "level": "medium",
+            "title": "Produk belum pernah sync",
+            "message": "Jalankan sync agar Wabot membaca katalog SpaceCraft terbaru.",
+            "action_label": "Sync Produk",
+            "action_to": "/dashboard/spacecraft-products",
+        })
+    elif latest_sync_event.get("type") == "spacecraft.products_sync_failed":
+        warnings.append({
+            "type": "sync_failed",
+            "level": "high",
+            "title": "Sync produk terakhir gagal",
+            "message": "Cek koneksi SpaceCraft Product Feed API dan key sinkronisasi.",
+            "action_label": "Cek Produk SpaceCraft",
+            "action_to": "/dashboard/spacecraft-products",
+        })
+    elif last_sync_age_minutes is not None and last_sync_age_minutes > 90:
+        warnings.append({
+            "type": "sync_stale",
+            "level": "medium",
+            "title": "Sync produk sudah lama",
+            "message": f"Sync terakhir sekitar {last_sync_age_minutes} menit lalu.",
+            "action_label": "Sync Produk",
+            "action_to": "/dashboard/spacecraft-products",
+        })
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "shop": _cc_clean_doc(shop),
+        "bot": _cc_clean_doc(bot_settings),
+        "summary": {
+            "products_total": products_total,
+            "products_active": products_active,
+            "products_no_price": products_no_price,
+            "products_no_image": products_no_image,
+            "leads_total": leads_total,
+            "leads_today": leads_today,
+            "leads_7d": leads_7d,
+            "leads_need_follow_up": leads_need_follow_up,
+            "leads_followed_up": leads_followed_up,
+            "leads_won": leads_won,
+            "leads_lost": leads_lost,
+            "sessions_total": sessions_total,
+            "messages_total": messages_total,
+            "last_sync_at": last_sync_at,
+            "last_sync_age_minutes": last_sync_age_minutes,
+            "bot_enabled": bool(bot_settings and bot_settings.get("enabled")),
+            "bot_mode": (bot_settings or {}).get("mode") or "off",
+        },
+        "warnings": warnings,
+        "recent": {
+            "leads": [_cc_clean_doc(x) for x in latest_leads],
+            "events": [_cc_clean_doc(x) for x in latest_events],
+            "conversations": [_cc_clean_doc(x) for x in latest_conversations],
+        },
+        "latest_sync_event": _cc_clean_doc(latest_sync_event),
     }
 
