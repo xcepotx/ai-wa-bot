@@ -37,7 +37,22 @@ def build_system_prompt(context: dict) -> str:
         status = ""
         if p.get("availability_status") == "out_of_stock" or p.get("stock", 1) == 0:
             status = " [HABIS]"
-        line = f"- {p['name']}: Rp {int(p.get('price', 0)):,}".replace(",", ".")
+        raw_price = p.get("price")
+        price_label = (p.get("price_label") or "").strip()
+
+        if raw_price is None:
+            price_text = price_label or "Harga perlu dikonfirmasi admin"
+        else:
+            try:
+                price_value = float(raw_price)
+                if price_value > 0:
+                    price_text = f"Rp {int(price_value):,}".replace(",", ".")
+                else:
+                    price_text = price_label or "Harga perlu dikonfirmasi admin"
+            except (TypeError, ValueError):
+                price_text = price_label or "Harga perlu dikonfirmasi admin"
+
+        line = f"- {p.get('name', 'Produk')}: {price_text}"
         if p.get("description"):
             line += f" — {p['description'][:80]}"
         line += status
