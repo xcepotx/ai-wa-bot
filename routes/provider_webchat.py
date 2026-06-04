@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from deps import db, now_iso, new_id
 from routes.simulate import simulate, SimulateIn
+from services.webchat_leads import process_webchat_lead
 
 router = APIRouter()
 
@@ -105,6 +106,53 @@ async def provider_webchat_message(data: WebChatMessageIn, request: Request):
         {"$set": {"channel": "webchat"}},
     )
 
+    lead_result = await process_webchat_lead(
+        shop_id=shop["shop_id"],
+        session_id=session_id,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        message=message,
+        page_url=data.page_url,
+        origin=request.headers.get("origin"),
+        sim_result=sim_result,
+    )
+
+    bot_reply = sim_result.get("bot_reply") or ""
+    if lead_result.get("reply_override"):
+        bot_reply = lead_result["reply_override"]
+    elif lead_result.get("append_reply"):
+        bot_reply = (bot_reply.rstrip() + "\n\n" + lead_result["append_reply"]).strip()
+
+    if lead_result.get("reply_override") or lead_result.get("append_reply"):
+        now = now_iso()
+        await db.messages.insert_one({
+            "message_id": new_id("msg"),
+            "session_id": session_id,
+            "shop_id": shop["shop_id"],
+            "role": "assistant",
+            "channel": "webchat",
+            "text": bot_reply,
+            "intent": "lead_capture",
+            "confidence": sim_result.get("confidence"),
+            "source": "lead_capture",
+            "metadata": {
+                "lead_id": lead_result.get("lead_id"),
+                "captured": lead_result.get("captured", False),
+                "contact_requested": lead_result.get("contact_requested", False),
+            },
+            "created_at": now,
+        })
+        await db.sessions.update_one(
+            {"session_id": session_id, "shop_id": shop["shop_id"]},
+            {
+                "$set": {
+                    "last_reply": bot_reply,
+                    "updated_at": now,
+                },
+                "$inc": {"message_count": 1},
+            },
+        )
+
     await _write_event(
         shop["shop_id"],
         "provider.webchat.message_received",
@@ -117,6 +165,11 @@ async def provider_webchat_message(data: WebChatMessageIn, request: Request):
             "origin": request.headers.get("origin"),
             "reply_source": sim_result.get("source"),
             "intent": sim_result.get("intent"),
+            "lead": {
+                "lead_id": lead_result.get("lead_id"),
+                "captured": lead_result.get("captured", False),
+                "contact_requested": lead_result.get("contact_requested", False),
+            },
         },
     )
 
@@ -127,11 +180,12 @@ async def provider_webchat_message(data: WebChatMessageIn, request: Request):
         "shop_name": shop.get("name"),
         "session_id": session_id,
         "customer_message": message,
-        "reply": sim_result.get("bot_reply"),
-        "bot_reply": sim_result.get("bot_reply"),
+        "reply": bot_reply,
+        "bot_reply": bot_reply,
         "intent": sim_result.get("intent"),
         "confidence": sim_result.get("confidence"),
-        "handoff_required": sim_result.get("handoff_required"),
-        "status": sim_result.get("status"),
+        "handoff_required": sim_result.get("handoff_required") or lead_result.get("captured", False),
+        "status": "handoff" if lead_result.get("captured") else sim_result.get("status"),
         "source": sim_result.get("source"),
+        "lead": lead_result,
     }
