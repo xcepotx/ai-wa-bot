@@ -12,6 +12,8 @@ from routes.provider_mock import router as provider_mock_router
 from routes.provider_waha import router as provider_waha_router
 from routes.provider_webchat import router as provider_webchat_router
 from routes.provider_spacecraft_sync import router as provider_spacecraft_sync_router
+from routes.spacecraft_owner_sync import router as spacecraft_owner_sync_router
+from routes.webchat_leads import router as webchat_leads_router
 from routes.provider_credentials import router as provider_credentials_router
 from routes.provider_meta import router as provider_meta_router
 ALL_ROUTERS = [
@@ -21,6 +23,8 @@ ALL_ROUTERS = [
     provider_waha_router,
     provider_webchat_router,
     provider_spacecraft_sync_router,
+    spacecraft_owner_sync_router,
+    webchat_leads_router,
     provider_readiness_router,
     admin_router,
     conversations_router,

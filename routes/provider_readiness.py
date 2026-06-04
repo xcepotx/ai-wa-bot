@@ -92,6 +92,28 @@ def _product_price(product: dict) -> Optional[float]:
         return None
 
 
+
+
+def _product_has_price_info(product: dict) -> bool:
+    """Accept numeric price or explicit quote/contact price label as usable price info."""
+    for key in ("price", "base_price", "min_price"):
+        try:
+            raw = product.get(key)
+            if raw is not None and float(raw) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    label = str(product.get("price_label") or "").strip().lower()
+    if label and label not in {"rp 0", "rp0", "0", "none", "null", "-"}:
+        return True
+
+    mode = str(product.get("price_mode") or "").strip().lower()
+    if mode in {"quote", "contact", "custom", "request_quote"}:
+        return True
+
+    return False
+
 def _is_product_active(product: dict) -> bool:
     if product.get("is_active") is False:
         return False
@@ -222,10 +244,6 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
     hours = shop_status.get("business_hours")
 
     fallback_message = bot_settings.get("fallback_message")
-    handoff_keywords = bot_settings.get("handoff_keywords") or []
-    if isinstance(handoff_keywords, str):
-        handoff_keywords = [x.strip() for x in handoff_keywords.split(",") if x.strip()]
-
     mode = bot_settings.get("mode") or "off"
     enabled = bool(bot_settings.get("enabled"))
     admin_disabled = bool(bot_settings.get("admin_disabled"))
@@ -289,10 +307,10 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
     _add_check(
         checks,
         "product_prices",
-        "Produk aktif punya harga",
+        "Produk aktif punya info harga",
         len(active_products) > 0 and len(products_with_price) == len(active_products),
-        10,
-        f"{len(products_with_price)}/{len(active_products)} produk punya harga · source: {catalog_source_info.get('catalog_source_label')}",
+        5,
+        f"{len(products_with_price)}/{len(active_products)} produk punya info harga/estimasi · source: {catalog_source_info.get('catalog_source_label')}",
         action_url="/dashboard/products",
     )
 
@@ -321,7 +339,7 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
         "business_hours",
         "Jam operasional tersedia",
         _truthy_text(hours),
-        10,
+        5,
         (
             f"Sudah diisi dari {shop_status.get('source_label')} · "
             f"status: {shop_status.get('status_label')} · "
@@ -335,18 +353,8 @@ async def calculate_provider_readiness(shop_id: str) -> dict:
         "fallback_message",
         "Fallback message tersedia",
         _truthy_text(fallback_message),
-        5,
+        10,
         "Sudah diisi" if _truthy_text(fallback_message) else "Fallback belum diatur",
-        action_url="/dashboard/bot",
-    )
-
-    _add_check(
-        checks,
-        "handoff_keywords",
-        "Handoff keyword tersedia",
-        len(handoff_keywords) > 0,
-        5,
-        f"{len(handoff_keywords)} keyword",
         action_url="/dashboard/bot",
     )
 

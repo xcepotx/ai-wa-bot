@@ -20,10 +20,48 @@ async def _get_user_shop(user: dict) -> dict:
     return shop
 
 
+
+
+def _has_usable_price(product: dict) -> bool:
+    """Return True when a product has a usable numeric price or quote-style price label."""
+    raw = product.get("price")
+    try:
+        if raw is not None and float(raw) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    for key in ("base_price", "min_price"):
+        raw = product.get(key)
+        try:
+            if raw is not None and float(raw) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    label = str(product.get("price_label") or "").strip().lower()
+    if label and label not in {"rp 0", "rp0", "0", "none", "null"}:
+        # Custom/quote products are valid for readiness as long as they do not crash auto-reply.
+        return True
+
+    mode = str(product.get("price_mode") or "").strip().lower()
+    if mode in {"quote", "contact", "custom"}:
+        return True
+
+    return False
+
 async def _calculate_readiness(shop_id: str) -> dict:
     shop     = await db.shops.find_one({"shop_id": shop_id}, {"_id": 0}) or {}
     products = await db.products.find(
-        {"shop_id": shop_id, "is_active": True}, {"_id": 0, "price": 1}
+        {"shop_id": shop_id, "is_active": True},
+        {
+            "_id": 0,
+            "price": 1,
+            "price_label": 1,
+            "price_mode": 1,
+            "base_price": 1,
+            "min_price": 1,
+        },
     ).to_list(100)
     payment  = await db.payment_info.find_one({"shop_id": shop_id}) or {}
     faqs     = await db.bot_faqs.find(
@@ -42,13 +80,13 @@ async def _calculate_readiness(shop_id: str) -> dict:
         "deskripsi_toko":   (bool(shop.get("description")),                10),
         "whatsapp_ada":     (bool(shop.get("whatsapp")),                   10),
         "produk_minimal_3": (len(products) >= 3,                           15),
-        "harga_lengkap":    (all(p.get("price", 0) > 0 for p in products)
+        "harga_lengkap":    (all(_has_usable_price(p) for p in products)
                              and len(products) > 0,                        10),
         "jam_buka_ada":     (bool(shop.get("hours")),                      10),
         "payment_ada":      (payment_ok,                                   10),
         "faq_minimal_5":    (len(faqs) >= 5,                               10),
-        "handoff_keyword":  (bool(settings.get("handoff_keywords")),       10),
-        "fallback_message": (bool(settings.get("fallback_message")),        5),
+        # Handoff keywords are optional advanced routing rules, not readiness requirements.
+        "fallback_message": (bool(settings.get("fallback_message")),       10),
         "sudah_simulasi":   (bool(settings.get("last_simulated_at")),       5),
     }
 
