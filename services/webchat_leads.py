@@ -13,8 +13,8 @@ PHONE_RE = re.compile(r"(?:(?:\+?62)|0)\s?[-\s]?\d(?:[-\s]?\d){7,14}")
 ORDER_KEYWORDS = [
     "mau pesan", "pesan", "order", "beli", "checkout", "minat", "tertarik",
     "mau ini", "ambil", "booking", "dp", "custom", "request", "buatkan",
-    "bisa buat", "bisa bikin", "estimasi", "quote", "quotation", "harga",
-    "berapa", "superman", "anime", "figure", "figur", "model 3d", "3d print",
+    "bisa buat", "bisa bikin", "estimasi", "quote", "quotation",
+    "superman", "anime", "figure", "figur", "model 3d", "3d print",
 ]
 
 

@@ -276,7 +276,51 @@ def _extract_products(context: Dict[str, Any]) -> List[Dict[str, Any]]:
     return products
 
 
+
+CUSTOM_REQUEST_TERMS = {
+    "custom", "desain sendiri", "design sendiri", "buat desain", "buatkan",
+    "bikin", "request", "pesan custom", "custom 3d print", "model sendiri",
+    "file sendiri", "estimasi custom", "keychain custom", "gantungan custom",
+}
+
+
+def _is_custom_request_without_specific_product(message: str, products: List[Dict[str, Any]]) -> bool:
+    msg_norm = _normalize(message)
+    if not any(term in msg_norm for term in CUSTOM_REQUEST_TERMS):
+        return False
+
+    # If customer mentions a specific product name or strong owner alias,
+    # allow product matcher. Example: "custom warna Oreo Clicker".
+    for product in products:
+        if not _is_product_active(product):
+            continue
+
+        strong_terms = []
+        strong_terms.extend(_split_match_text(product.get("name")))
+        strong_terms.extend(_split_match_text(product.get("name_en")))
+        strong_terms.extend(_split_match_text(product.get("sku")))
+        strong_terms.extend(_split_match_text(product.get("bot_aliases")))
+
+        for term in strong_terms:
+            term_norm = _normalize(term)
+            if not term_norm:
+                continue
+
+            # Ignore generic aliases accidentally saved by owner.
+            if term_norm in GENERIC_PRODUCT_MATCH_TERMS:
+                continue
+
+            # Require a meaningful specific term.
+            if len(term_norm) >= 4 and term_norm in msg_norm:
+                return False
+
+    return True
+
+
 def _match_product(message: str, products: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], float]:
+    if _is_custom_request_without_specific_product(message, products):
+        return None, 0.0
+
     msg_norm = _normalize(message)
     msg_tokens = _tokens(msg_norm)
 
@@ -323,6 +367,29 @@ def _match_product(message: str, products: List[Dict[str, Any]]) -> Tuple[Option
         return best, best_score
 
     return None, best_score
+
+
+
+GENERIC_PRODUCT_MATCH_TERMS = {
+    "produk", "product", "spacecraft", "space craft",
+    "tanya", "cek", "harga", "price",
+    "custom", "custom 3d print", "3d print", "print", "cetak",
+    "hadiah", "gift", "kado",
+    "gantungan", "keychain",
+    "anime", "figur", "figure",
+    "lampu", "table lamp", "lamp",
+    "order", "pesan", "beli",
+    "estimasi", "request", "ukuran", "warna",
+}
+
+
+def _product_term_weight(text: str, weight: float) -> float:
+    key = _normalize(text)
+    # Generic single/category terms must not be strong enough to select
+    # a specific product by themselves. Exact product names stay strong.
+    if key in GENERIC_PRODUCT_MATCH_TERMS and weight < 1.0:
+        return min(weight, 0.35)
+    return weight
 
 
 def _split_match_text(value: Any) -> List[str]:
@@ -374,7 +441,7 @@ def _product_match_terms(product: Dict[str, Any]) -> List[Tuple[str, float]]:
         if not key or key in seen:
             continue
         seen.add(key)
-        deduped.append((text, weight))
+        deduped.append((text, _product_term_weight(text, weight)))
 
     return deduped
 
