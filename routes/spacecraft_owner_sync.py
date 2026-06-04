@@ -3,12 +3,19 @@ from datetime import datetime, timedelta, timezone
 import os
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel
 
 from deps import db, require_user, now_iso, new_id
 from services.spacecraft_product_sync import sync_spacecraft_products
 
 
 router = APIRouter()
+
+
+class SpaceCraftProductIntelligenceIn(BaseModel):
+    bot_aliases: list[str] = []
+    bot_keywords: list[str] = []
+    bot_notes: str = ""
 
 
 def _expected_spacecraft_shop_id() -> str:
@@ -199,6 +206,9 @@ async def owner_spacecraft_products(
         "product_url": 1,
         "spacecraft_updated_at": 1,
         "updated_at": 1,
+        "bot_aliases": 1,
+        "bot_keywords": 1,
+        "bot_notes": 1,
     }
 
     total = await db.products.count_documents(query)
@@ -276,6 +286,124 @@ async def owner_spacecraft_sync_history(
         "ok": True,
         "items": items,
         "total": len(items),
+    }
+
+
+def _clean_intel_list(values):
+    if not isinstance(values, list):
+        return []
+    out = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        text = text[:80]
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= 30:
+            break
+    return out
+
+
+@router.get("/spacecraft/products/{product_id}/intelligence")
+async def owner_spacecraft_product_intelligence(product_id: str, request: Request):
+    _, shop_id = await _require_spacecraft_owner(request)
+
+    product = await db.products.find_one(
+        {
+            "shop_id": shop_id,
+            "source": "spacecraft_api",
+            "product_id": product_id,
+        },
+        {
+            "_id": 0,
+            "product_id": 1,
+            "name": 1,
+            "category": 1,
+            "category_name": 1,
+            "search_keywords": 1,
+            "bot_aliases": 1,
+            "bot_keywords": 1,
+            "bot_notes": 1,
+            "updated_at": 1,
+        },
+    )
+
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk SpaceCraft tidak ditemukan.")
+
+    return {
+        "ok": True,
+        "product": product,
+        "intelligence": {
+            "bot_aliases": product.get("bot_aliases") or [],
+            "bot_keywords": product.get("bot_keywords") or [],
+            "bot_notes": product.get("bot_notes") or "",
+        },
+    }
+
+
+@router.put("/spacecraft/products/{product_id}/intelligence")
+async def owner_spacecraft_update_product_intelligence(
+    product_id: str,
+    data: SpaceCraftProductIntelligenceIn,
+    request: Request,
+):
+    user, shop_id = await _require_spacecraft_owner(request)
+
+    update = {
+        "bot_aliases": _clean_intel_list(data.bot_aliases),
+        "bot_keywords": _clean_intel_list(data.bot_keywords),
+        "bot_notes": str(data.bot_notes or "").strip()[:1200],
+        "intelligence_updated_at": now_iso(),
+        "intelligence_updated_by": user.get("email") or user.get("user_id"),
+        "updated_at": now_iso(),
+    }
+
+    result = await db.products.update_one(
+        {
+            "shop_id": shop_id,
+            "source": "spacecraft_api",
+            "product_id": product_id,
+        },
+        {"$set": update},
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Produk SpaceCraft tidak ditemukan.")
+
+    product = await db.products.find_one(
+        {"shop_id": shop_id, "source": "spacecraft_api", "product_id": product_id},
+        {"_id": 0},
+    )
+
+    await db.bot_events.insert_one({
+        "event_id": new_id("evt"),
+        "shop_id": shop_id,
+        "type": "spacecraft.product_intelligence_updated",
+        "payload": {
+            "product_id": product_id,
+            "product_name": product.get("name") if product else None,
+            "bot_aliases_count": len(update["bot_aliases"]),
+            "bot_keywords_count": len(update["bot_keywords"]),
+            "user_id": user.get("user_id"),
+            "email": user.get("email"),
+        },
+        "created_at": now_iso(),
+    })
+
+    return {
+        "ok": True,
+        "product": product,
+        "intelligence": {
+            "bot_aliases": update["bot_aliases"],
+            "bot_keywords": update["bot_keywords"],
+            "bot_notes": update["bot_notes"],
+        },
     }
 
 

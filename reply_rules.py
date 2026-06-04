@@ -287,24 +287,33 @@ def _match_product(message: str, products: List[Dict[str, Any]]) -> Tuple[Option
         if not _is_product_active(product):
             continue
 
-        name = product.get("name") or ""
-        name_norm = _normalize(name)
-        name_tokens = _tokens(name_norm)
-
-        if not name_tokens:
+        candidate_terms = _product_match_terms(product)
+        if not candidate_terms:
             continue
 
         score = 0.0
 
-        if name_norm and name_norm in msg_norm:
-            score = 1.0
-        else:
-            overlap = len(name_tokens & msg_tokens)
-            score = overlap / max(len(name_tokens), 1)
+        for term, weight in candidate_terms:
+            term_norm = _normalize(term)
+            term_tokens = _tokens(term_norm)
 
-            # Boost partial long-token match, e.g. "urat" for "Bakso Urat".
-            if any(t in msg_tokens for t in name_tokens if len(t) >= 4):
-                score = max(score, 0.55)
+            if not term_tokens:
+                continue
+
+            term_score = 0.0
+
+            if term_norm and term_norm in msg_norm:
+                term_score = weight
+            else:
+                overlap = len(term_tokens & msg_tokens)
+                term_score = (overlap / max(len(term_tokens), 1)) * weight
+
+                # Boost partial long-token match, e.g. "urat" for "Bakso Urat",
+                # "keychain" for alias/keyword, or "lampu" for category/search keyword.
+                if any(t in msg_tokens for t in term_tokens if len(t) >= 4):
+                    term_score = max(term_score, min(weight, 0.55))
+
+            score = max(score, term_score)
 
         if score > best_score:
             best = product
@@ -314,6 +323,60 @@ def _match_product(message: str, products: List[Dict[str, Any]]) -> Tuple[Option
         return best, best_score
 
     return None, best_score
+
+
+def _split_match_text(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw = value
+    else:
+        raw = re.split(r"[,;|\n]+", str(value))
+
+    out = []
+    for item in raw:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _product_match_terms(product: Dict[str, Any]) -> List[Tuple[str, float]]:
+    terms: List[Tuple[str, float]] = []
+
+    def add(value: Any, weight: float):
+        for text in _split_match_text(value):
+            terms.append((text, weight))
+
+    add(product.get("name"), 1.0)
+    add(product.get("name_en"), 0.9)
+    add(product.get("slug"), 0.85)
+    add(product.get("sku"), 0.85)
+
+    # Owner-curated intelligence has high priority.
+    add(product.get("bot_aliases"), 0.95)
+    add(product.get("bot_keywords"), 0.78)
+
+    # SpaceCraft feed keywords and product metadata.
+    add(product.get("search_keywords"), 0.72)
+    add(product.get("category_name") or product.get("category"), 0.62)
+    add(product.get("product_type"), 0.55)
+
+    # Short descriptions help generic product phrases, but keep lower weight
+    # to avoid over-matching broad words.
+    add(product.get("short_description"), 0.50)
+
+    # Deduplicate normalized terms.
+    deduped: List[Tuple[str, float]] = []
+    seen = set()
+    for text, weight in terms:
+        key = _normalize(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((text, weight))
+
+    return deduped
 
 
 def _get_remembered_product(session_doc: Dict[str, Any], products: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
