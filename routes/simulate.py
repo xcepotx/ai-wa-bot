@@ -1,7 +1,7 @@
 """Simulator route - test bot without real WhatsApp + persist sessions/messages."""
 import uuid
 import logging
-from typing import Optional
+from typing import Optional, Any, Dict
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -35,6 +35,7 @@ class SimulateOut(BaseModel):
     source: str
     status: str
     response_ms: int
+    product_card: Optional[Dict[str, Any]] = None
 
 
 @router.post("/simulate", response_model=SimulateOut)
@@ -106,6 +107,7 @@ async def simulate(data: SimulateIn):
     handoff_required = False
     status = "bot_replied"
     extra_session_update = {}
+    product_card = None
 
     safety_block = await _check_safety_block(data.shop_id, bot_settings)
     if safety_block:
@@ -165,6 +167,7 @@ async def simulate(data: SimulateIn):
             source=source,
             status=status,
             response_ms=response_ms,
+            product_card=product_card,
         )
 
     # 1. Hard handoff keyword.
@@ -205,6 +208,7 @@ async def simulate(data: SimulateIn):
                 intent = rule.get("intent", "general_inquiry")
                 confidence = rule.get("confidence", "high")
                 source = rule.get("source", "rule")
+                product_card = rule.get("product_card")
                 handoff_required = bool(rule.get("handoff_required", False))
                 extra_session_update = rule.get("session_update") or {}
                 status = "handoff" if handoff_required else "bot_replied"
@@ -300,6 +304,7 @@ async def simulate(data: SimulateIn):
         source=source,
         status=status,
         response_ms=response_ms,
+        product_card=product_card,
     )
 
 

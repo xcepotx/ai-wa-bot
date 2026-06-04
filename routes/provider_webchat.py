@@ -187,5 +187,6 @@ async def provider_webchat_message(data: WebChatMessageIn, request: Request):
         "handoff_required": sim_result.get("handoff_required") or lead_result.get("captured", False),
         "status": "handoff" if lead_result.get("captured") else sim_result.get("status"),
         "source": sim_result.get("source"),
+        "product_card": sim_result.get("product_card"),
         "lead": lead_result,
     }

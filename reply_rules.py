@@ -118,6 +118,7 @@ def build_rule_reply(
             "source": "rule_product_memory" if not matched_product else "rule_product",
             "handoff_required": False,
             "session_update": session_update,
+            "product_card": _build_product_card(product),
         }
 
     if _is_price_question(msg_norm) and price:
@@ -128,6 +129,7 @@ def build_rule_reply(
             "source": "rule_product",
             "handoff_required": False,
             "session_update": session_update,
+            "product_card": _build_product_card(product),
         }
 
     if _is_stock_question(msg_norm):
@@ -154,6 +156,7 @@ def build_rule_reply(
             "source": "rule_product",
             "handoff_required": handoff,
             "session_update": session_update,
+            "product_card": _build_product_card(product),
         }
 
     if _is_order_intent(msg_norm):
@@ -168,6 +171,7 @@ def build_rule_reply(
             "source": "rule_product",
             "handoff_required": False,
             "session_update": session_update,
+            "product_card": _build_product_card(product),
         }
 
     if price:
@@ -178,6 +182,7 @@ def build_rule_reply(
             "source": "rule_product",
             "handoff_required": False,
             "session_update": session_update,
+            "product_card": _build_product_card(product),
         }
 
     return {
@@ -187,6 +192,27 @@ def build_rule_reply(
         "source": "rule_product",
         "handoff_required": True,
         "session_update": session_update,
+        "product_card": _build_product_card(product),
+    }
+
+
+
+
+def _build_product_card(product: Dict[str, Any]) -> Dict[str, Any]:
+    price = _to_number(product.get("price"))
+    price_label = product.get("price_label")
+    if not price_label:
+        price_label = _format_rupiah(price) if price else "Harga perlu konfirmasi admin"
+
+    return {
+        "product_id": product.get("id") or product.get("product_id"),
+        "name": product.get("name") or "Produk SpaceCraft",
+        "price": price,
+        "price_label": price_label,
+        "image_url": product.get("image_url") or product.get("image"),
+        "product_url": product.get("product_url") or product.get("url"),
+        "product_type": product.get("product_type"),
+        "category": product.get("category") or product.get("category_name"),
     }
 
 
