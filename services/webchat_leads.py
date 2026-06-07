@@ -79,6 +79,17 @@ def should_request_contact(message: str, sim_result: Dict[str, Any]) -> bool:
     source = (sim_result.get("source") or "").lower()
     confidence = (sim_result.get("confidence") or "").lower()
 
+    strong_contact_or_order = any(k in lower for k in [
+        "mau pesan", "pesan sekarang", "order sekarang", "checkout", "beli sekarang",
+        "ambil", "dp", "booking", "lanjut order", "lanjut pesan",
+        "nomor saya", "wa saya", "whatsapp saya", "ini nomor", "hubungi saya",
+    ])
+
+    # For early custom consultation from the recommendation engine, do not ask for contact too soon.
+    # Let the customer answer reference/idea/brief first, otherwise the reply feels like two questions at once.
+    if intent == "custom_request" and source == "rule_recommendation" and not strong_contact_or_order:
+        return False
+
     if any(k in lower for k in ORDER_KEYWORDS):
         return True
 

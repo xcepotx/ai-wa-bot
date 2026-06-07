@@ -42,6 +42,16 @@ def build_rule_reply(
     if _is_product_list_question(msg_norm):
         return _reply_product_list(products, context)
 
+    recommendation = _reply_smart_recommendation(
+        original_message=message,
+        msg_norm=msg_norm,
+        products=products,
+        context=context,
+        session_doc=session_doc,
+    )
+    if recommendation:
+        return recommendation
+
     if _is_payment_question(msg_norm):
         payment = _extract_payment_text(context)
         if payment:
@@ -414,6 +424,294 @@ def _reply_product_list(products: List[Dict[str, Any]], context: Dict[str, Any])
         "handoff_required": False,
         "session_update": {},
     }
+
+
+RECOMMENDATION_NEED_TERMS = {
+    "gift": {
+        "hadiah", "kado", "souvenir", "gift", "lucu", "unik", "cute",
+        "buat anak", "untuk anak", "koleksi", "temen", "teman", "pacar",
+    },
+    "fidget": {
+        "fidget", "clicker", "keychain", "gantungan", "mainan", "pencet",
+        "stress", "anti stress", "tas", "kunci",
+    },
+    "lamp": {
+        "lampu", "lamp", "table lamp", "dekorasi", "meja", "kamar",
+        "pendant", "hiasan",
+    },
+    "custom": {
+        "custom", "buatkan", "bikinin", "bikin", "request", "karakter",
+        "anime", "figure", "figur", "model", "3d print", "cetak", "desain sendiri",
+    },
+}
+
+
+def _reply_smart_recommendation(
+    *,
+    original_message: str,
+    msg_norm: str,
+    products: List[Dict[str, Any]],
+    context: Dict[str, Any],
+    session_doc: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    active = [p for p in products if _is_product_active(p)]
+    if not active:
+        return None
+
+    needs = _detect_recommendation_needs(msg_norm)
+    if not needs:
+        return None
+
+    # If the customer clearly mentions a product name such as "Coffee Latte" or "Oreo",
+    # let the normal product matcher handle it. Generic words like clicker/keychain do not count.
+    if _has_specific_product_mention(original_message, active):
+        return None
+
+    ranked = _rank_products_for_needs(active, needs)
+    if not ranked:
+        return None
+
+    selected = ranked[:3]
+    reply = _build_recommendation_reply(selected, needs, context)
+
+    session_update = {
+        "recommendation_context": {
+            "needs": needs,
+            "recommended_product_ids": [
+                p.get("id") or p.get("product_id")
+                for p in selected
+                if p.get("id") or p.get("product_id")
+            ],
+            "updated_from": "smart_recommendation",
+        }
+    }
+
+    intent = "custom_request" if "custom" in needs else "product_recommendation"
+
+    return {
+        "reply": reply,
+        "intent": intent,
+        "confidence": "high",
+        "source": "rule_recommendation",
+        "handoff_required": False,
+        "session_update": session_update,
+    }
+
+
+def _detect_recommendation_needs(msg_norm: str) -> List[str]:
+    needs = []
+
+    # Recommendation intent can be explicit or implied by broad category/use-case wording.
+    has_reco_intent = any(term in msg_norm for term in [
+        "rekomendasi", "rekomendasiin", "pilihin", "pilihkan", "saran",
+        "yang cocok", "cocok", "ada yang", "punya yang", "buat ", "untuk ",
+        "mau yang", "cari yang", "lihat yang",
+    ])
+
+    for need, terms in RECOMMENDATION_NEED_TERMS.items():
+        if any(term in msg_norm for term in terms):
+            needs.append(need)
+
+    if not needs:
+        return []
+
+    # If the message only says a very specific product name, do not treat it as recommendation.
+    # But category wording like "ada yang fidget clicker" should still be recommendation.
+    if has_reco_intent:
+        return _dedupe_needs(needs)
+
+    # Strong category terms also count even without explicit "rekomendasi".
+    if any(k in msg_norm for k in ["fidget", "clicker", "keychain", "gantungan", "lampu", "table lamp", "custom", "anime", "figure", "figur"]):
+        return _dedupe_needs(needs)
+
+    return []
+
+
+def _dedupe_needs(needs: List[str]) -> List[str]:
+    order = ["custom", "gift", "fidget", "lamp", "ready"]
+    seen = set()
+    result = []
+
+    for item in needs:
+        if item not in seen:
+            seen.add(item)
+
+    for item in order:
+        if item in seen:
+            result.append(item)
+
+    return result
+
+
+def _has_specific_product_mention(message: str, products: List[Dict[str, Any]]) -> bool:
+    msg_norm = _normalize(message)
+    msg_tokens = _tokens(msg_norm)
+
+    generic = set(GENERIC_PRODUCT_MATCH_TERMS) | {
+        "clicker", "fidget", "keychain", "gantungan", "lampu", "lamp",
+        "custom", "hadiah", "kado", "souvenir", "lucu", "unik", "produk",
+    }
+
+    for product in products:
+        name = _normalize(product.get("name"))
+        if not name:
+            continue
+
+        name_tokens = _tokens(name)
+        meaningful = [
+            token for token in name_tokens
+            if len(token) >= 4 and token not in generic and token not in STOPWORDS
+        ]
+
+        # Example: "coffee latte", "oreo", "squid", "tulip", "billow".
+        if any(token in msg_tokens for token in meaningful):
+            return True
+
+        if len(meaningful) >= 2 and all(token in msg_tokens for token in meaningful[:2]):
+            return True
+
+    return False
+
+
+def _recommendation_text(product: Dict[str, Any]) -> str:
+    parts = [
+        product.get("name"),
+        product.get("category"),
+        product.get("category_name"),
+        product.get("product_type"),
+        product.get("short_description"),
+        product.get("description"),
+        product.get("search_keywords"),
+    ]
+    return _normalize(" ".join(str(x) for x in parts if x))
+
+
+def _rank_products_for_needs(products: List[Dict[str, Any]], needs: List[str]) -> List[Dict[str, Any]]:
+    scored = []
+
+    for product in products:
+        text = _recommendation_text(product)
+        price = _to_number(product.get("price"))
+        score = 0.0
+
+        if "custom" in needs:
+            # Custom request should recommend only explicit custom service/products.
+            # Do not include ordinary physical/preorder items like bowls, lamps, or ready stock products.
+            custom_text = _normalize(" ".join(str(x or "") for x in [
+                product.get("name"),
+                product.get("category"),
+                product.get("category_name"),
+                product.get("slug"),
+                product.get("sku"),
+            ]))
+
+            is_custom_service = any(k in custom_text for k in [
+                "custom 3d print",
+                "custom gift",
+                "custom souvenir",
+                "custom-print",
+                "custom print",
+                "custom",
+            ])
+
+            if not is_custom_service:
+                continue
+
+            score += 10
+
+        if "gift" in needs:
+            if any(k in text for k in ["gift", "hadiah", "kado", "souvenir"]):
+                score += 4
+            if any(k in text for k in ["clicker", "fidget", "keychain", "gantungan", "cute", "lucu", "oreo", "coffee", "squid"]):
+                score += 3
+            if price and price <= 25000:
+                score += 1.5
+
+        if "fidget" in needs:
+            if any(k in text for k in ["clicker", "fidget"]):
+                score += 6
+            if any(k in text for k in ["keychain", "gantungan"]):
+                score += 2
+            if price and price <= 25000:
+                score += 1
+
+        if "lamp" in needs:
+            if any(k in text for k in ["lamp", "lampu", "table lamp", "pendant", "dekorasi"]):
+                score += 7
+
+        if product.get("is_recommended"):
+            score += 0.5
+
+        if score > 0:
+            scored.append((score, _recommendation_tiebreaker(product), product))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in scored]
+
+
+def _recommendation_tiebreaker(product: Dict[str, Any]) -> float:
+    price = _to_number(product.get("price"))
+    return float(price or 999999999)
+
+
+def _recommendation_reason(product: Dict[str, Any], needs: List[str]) -> str:
+    text = _recommendation_text(product)
+    name = _normalize(product.get("name"))
+
+    if "custom" in needs:
+        if "3d print" in name or "print" in name:
+            return "untuk bikin model dari referensi, gambar, atau file 3D"
+        if "gift" in name or "souvenir" in name:
+            return "untuk hadiah/souvenir custom dengan konsep tertentu"
+        return "untuk kebutuhan custom yang perlu dicek detail ukurannya"
+
+    if "lamp" in needs and any(k in text for k in ["lamp", "lampu", "table lamp", "pendant"]):
+        return "cocok untuk dekorasi meja/kamar atau hadiah yang lebih standout"
+    if "fidget" in needs and any(k in text for k in ["clicker", "fidget"]):
+        return "cocok untuk fidget kecil dan gantungan yang enak dibawa"
+    if "gift" in needs:
+        if "coffee" in name or "latte" in name:
+            return "cocok untuk pecinta kopi"
+        if "oreo" in name:
+            return "lucu untuk hadiah ringan dengan budget hemat"
+        if "squid" in name or "cute" in name:
+            return "lebih unik dan playful untuk koleksi atau hadiah"
+        if "lipbalm" in name:
+            return "praktis sebagai gantungan kecil yang fungsional"
+        return "cocok untuk hadiah kecil yang personal"
+
+    return "opsi yang relevan dengan kebutuhan kakak"
+
+
+def _build_recommendation_reply(products: List[Dict[str, Any]], needs: List[str], context: Dict[str, Any]) -> str:
+    shop_name = _extract_shop_name(context)
+
+    if "custom" in needs:
+        opener = "Bisa kak. Untuk custom karakter/model, opsi awalnya:"
+        closing = "Kakak sudah punya gambar/file referensi, atau masih berupa ide kasar?"
+    elif "lamp" in needs:
+        opener = "Ada kak. Untuk lampu/dekorasi, saya rekomendasikan opsi ini:"
+        closing = "Kakak cari untuk meja kerja, kamar, atau hadiah?"
+    elif "fidget" in needs:
+        opener = "Ada kak. Untuk fidget/clicker, pilihan yang paling cocok:"
+        closing = "Kakak mau yang budget hemat, yang paling lucu, atau yang bentuknya lebih unik?"
+    elif "gift" in needs:
+        opener = "Bisa kak. Untuk hadiah yang lucu, saya rekomendasikan ini:"
+        closing = "Kakak mau yang budget hemat, paling lucu, atau yang terlihat lebih premium?"
+    else:
+        opener = f"Siap kak. Di {shop_name}, saya rekomendasikan ini:" if shop_name else "Siap kak. Saya rekomendasikan ini:"
+        closing = "Kakak mau saya bantu pilihkan satu yang paling cocok?"
+
+    lines = []
+    for idx, product in enumerate(products, 1):
+        name = product.get("name") or f"Produk {idx}"
+        price = _to_number(product.get("price"))
+        price_text = _format_rupiah(price) if price else (product.get("price_label") or "harga konfirmasi admin")
+        reason = _recommendation_reason(product, needs)
+        lines.append(f"{idx}. {name} — {price_text}, {reason}.")
+
+    return opener + "\n" + "\n".join(lines) + "\n\n" + closing
+
 
 def _extract_products(context: Dict[str, Any]) -> List[Dict[str, Any]]:
     candidates: List[Any] = []
