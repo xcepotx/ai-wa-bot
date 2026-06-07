@@ -4,7 +4,6 @@ import re
 from typing import Any, Dict, Optional
 
 from deps import db, now_iso, new_id
-from routes.provider_waha import _send_waha_text
 
 
 PHONE_RE = re.compile(r"(?:(?:\+?62)|0)\s?[-\s]?\d(?:[-\s]?\d){7,14}")
@@ -73,11 +72,36 @@ def extract_name(message: str, phone: Optional[str]) -> Optional[str]:
     return None
 
 
+def _reply_already_requests_contact(sim_result: Dict[str, Any]) -> bool:
+    text = (
+        str(sim_result.get("bot_reply") or "") + "\n" +
+        str(sim_result.get("reply") or "")
+    ).lower()
+
+    contact_markers = [
+        "nomor whatsapp",
+        "nomor wa",
+        "whatsapp aktif",
+        "wa aktif",
+        "tinggalkan nama",
+        "kirim nama",
+        "nama dan nomor",
+        "nama & nomor",
+    ]
+
+    return any(marker in text for marker in contact_markers)
+
+
+
 def should_request_contact(message: str, sim_result: Dict[str, Any]) -> bool:
     lower = (message or "").lower()
     intent = (sim_result.get("intent") or "").lower()
     source = (sim_result.get("source") or "").lower()
     confidence = (sim_result.get("confidence") or "").lower()
+
+    # Avoid duplicate contact prompts when the sales/reply rule already asks for name + WhatsApp.
+    if _reply_already_requests_contact(sim_result):
+        return False
 
     strong_contact_or_order = any(k in lower for k in [
         "mau pesan", "pesan sekarang", "order sekarang", "checkout", "beli sekarang",
@@ -271,6 +295,14 @@ def _build_owner_need_summary(message: str, custom_summary: Optional[str], ready
     return _clean_text(message, 1000) or "-"
 
 
+def _send_waha_text_lazy(chat_id: str, text: str) -> dict:
+    # Lazy import to avoid circular import:
+    # services.webchat_leads -> routes.provider_waha -> routes.__init__ -> routes.provider_webchat -> services.webchat_leads
+    from routes.provider_waha import _send_waha_text
+    return _send_waha_text(chat_id, text)
+
+
+
 async def _notify_owner(lead: Dict[str, Any]) -> Dict[str, Any]:
     enabled = os.environ.get("WEBCHAT_LEAD_NOTIFY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     owner_phone = os.environ.get("SPACECRAFT_OWNER_WA", "").strip()
@@ -296,7 +328,7 @@ async def _notify_owner(lead: Dict[str, Any]) -> Dict[str, Any]:
         "Mohon follow up manual ya."
     )
 
-    return _send_waha_text(wa_chat_id(owner_phone), text)
+    return _send_waha_text_lazy(wa_chat_id(owner_phone), text)
 
 
 async def process_webchat_lead(

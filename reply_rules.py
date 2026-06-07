@@ -42,6 +42,16 @@ def build_rule_reply(
     if _is_product_list_question(msg_norm):
         return _reply_product_list(products, context)
 
+    buyer_intent = _reply_buyer_intent_followup(
+        original_message=message,
+        msg_norm=msg_norm,
+        products=products,
+        context=context,
+        session_doc=session_doc,
+    )
+    if buyer_intent:
+        return buyer_intent
+
     recommendation = _reply_smart_recommendation(
         original_message=message,
         msg_norm=msg_norm,
@@ -212,6 +222,272 @@ def build_rule_reply(
     }
 
 
+
+
+
+def _reply_buyer_intent_followup(
+    *,
+    original_message: str,
+    msg_norm: str,
+    products: List[Dict[str, Any]],
+    context: Dict[str, Any],
+    session_doc: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    remembered_product = _get_remembered_product(session_doc, products)
+    quantity = _extract_quantity(msg_norm)
+
+    if remembered_product and _is_price_objection(msg_norm):
+        return _reply_price_objection(remembered_product)
+
+    if remembered_product and _is_discount_question(msg_norm):
+        return _reply_discount_objection(remembered_product)
+
+    if _custom_context_active(session_doc) and _is_custom_deadline_question(msg_norm):
+        brief = _merge_custom_brief(session_doc.get("custom_brief") or {}, original_message, msg_norm)
+        return {
+            "reply": (
+                "Bisa dicek dulu kak, tapi untuk custom saya tidak mau janji sebelum detailnya lengkap ya.\n\n"
+                "Biasanya admin perlu lihat referensi/model, ukuran, jumlah, dan finishing dulu. "
+                "Kalau targetnya minggu depan, nanti admin cek apakah masih aman dari sisi antrean produksi dan tingkat detail modelnya.\n\n"
+                "Kakak sudah punya gambar/file referensi, atau masih berupa ide kasar?"
+            ),
+            "intent": "custom_deadline_inquiry",
+            "confidence": "high",
+            "source": "rule_buyer_intent",
+            "handoff_required": False,
+            "session_update": {
+                "buyer_stage": "custom_deadline_check",
+                "custom_brief": brief,
+            },
+        }
+
+    if _custom_context_active(session_doc) and _is_quality_objection(msg_norm):
+        brief = _merge_custom_brief(session_doc.get("custom_brief") or {}, original_message, msg_norm)
+        return {
+            "reply": (
+                "Wajar kak kalau mau pastikan hasilnya dulu.\n\n"
+                "Untuk custom, biasanya yang bikin hasil lebih aman itu referensi gambar yang jelas, ukuran yang realistis, "
+                "dan detail model yang bisa dicek dulu oleh admin. Kalau ada bagian yang sulit dibuat, admin akan konfirmasi dulu "
+                "sebelum lanjut supaya ekspektasinya jelas.\n\n"
+                "Kakak punya contoh gambar/referensi karakter yang diinginkan?"
+            ),
+            "intent": "quality_objection",
+            "confidence": "high",
+            "source": "rule_buyer_intent",
+            "handoff_required": False,
+            "session_update": {
+                "buyer_stage": "trust_building",
+                "custom_brief": brief,
+            },
+        }
+
+    if _is_cheapest_followup(msg_norm):
+        candidates = _recommended_products_from_session(session_doc, products)
+        if not candidates:
+            candidates = [p for p in products if _is_product_active(p) and _to_number(p.get("price"))]
+
+        selected = _pick_cheapest_products(candidates, limit=3)
+        if selected:
+            preferred = selected[0]
+            return {
+                "reply": _build_cheapest_reply(selected),
+                "intent": "budget_recommendation",
+                "confidence": "high",
+                "source": "rule_buyer_intent",
+                "handoff_required": False,
+                "session_update": {
+                    "buyer_stage": "budget_comparison",
+                    "current_product": _session_product_snapshot(preferred, "buyer_intent_cheapest"),
+                    "recommendation_context": {
+                        "needs": ["budget"],
+                        "recommended_product_ids": [
+                            p.get("id") or p.get("product_id") for p in selected
+                        ],
+                        "preferred_product_id": preferred.get("id") or preferred.get("product_id"),
+                        "updated_from": "buyer_intent_cheapest",
+                    },
+                },
+                "product_card": _build_product_card(preferred),
+            }
+
+    # If customer says "ambil 3 pcs" after a recommendation/cheapest context,
+    # use the remembered product and convert it into a ready-stock order.
+    if quantity and remembered_product and _is_order_intent(msg_norm):
+        price = _to_number(remembered_product.get("price"))
+        if price:
+            total = int(price * quantity)
+            return {
+                "reply": _sales_product_reply(remembered_product, mode="quantity_total", quantity=quantity, total=total),
+                "intent": "ready_stock_order",
+                "confidence": "high",
+                "source": "rule_buyer_intent",
+                "handoff_required": False,
+                "session_update": {
+                    "buyer_stage": "ready_to_order",
+                    "current_product": _session_product_snapshot(remembered_product, "buyer_intent_order"),
+                    "ready_stock_order": _build_ready_stock_order(remembered_product, quantity, total),
+                },
+                "product_card": _build_product_card(remembered_product),
+            }
+
+    return None
+
+
+def _session_product_snapshot(product: Dict[str, Any], updated_from: str) -> Dict[str, Any]:
+    return {
+        "product_id": product.get("id") or product.get("product_id"),
+        "name": product.get("name"),
+        "price": _to_number(product.get("price")),
+        "category": product.get("category") or product.get("category_name"),
+        "updated_from": updated_from,
+    }
+
+
+def _recommended_products_from_session(session_doc: Dict[str, Any], products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    reco = session_doc.get("recommendation_context") or {}
+    ids = reco.get("recommended_product_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return []
+
+    product_map = {}
+    for product in products:
+        pid = product.get("id") or product.get("product_id")
+        if pid:
+            product_map[str(pid)] = product
+
+    selected = []
+    for pid in ids:
+        product = product_map.get(str(pid))
+        if product and _is_product_active(product):
+            selected.append(product)
+
+    return selected
+
+
+def _pick_cheapest_products(products: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    priced = []
+    for product in products:
+        price = _to_number(product.get("price"))
+        if price and _is_product_active(product):
+            priced.append((price, _recommendation_tiebreaker(product), product))
+
+    priced.sort(key=lambda x: (x[0], x[1]))
+    return [p for _, _, p in priced[:limit]]
+
+
+def _build_cheapest_reply(products: List[Dict[str, Any]]) -> str:
+    if not products:
+        return "Untuk pilihan paling hemat, saya bantu cekkan ke admin dulu ya."
+
+    cheapest_price = _to_number(products[0].get("price"))
+    same_cheapest = [p for p in products if _to_number(p.get("price")) == cheapest_price]
+
+    lines = []
+    for idx, product in enumerate(products, 1):
+        name = product.get("name") or f"Produk {idx}"
+        price = _sales_price(product)
+        reason = _recommendation_reason(product, ["budget"])
+        lines.append(f"{idx}. {name} — {price}, {reason}.")
+
+    if len(same_cheapest) > 1:
+        names = " dan ".join((p.get("name") or "produk ini") for p in same_cheapest[:2])
+        opener = f"Untuk budget paling hemat, yang paling murah ada {names} kak."
+    else:
+        opener = f"Untuk budget paling hemat, saya paling sarankan {products[0].get('name') or 'produk pertama'} kak."
+
+    preferred = products[0].get("name") or "produk pertama"
+    return (
+        f"{opener}\n\n"
+        + "\n".join(lines)
+        + f"\n\nKalau mau yang paling aman dan universal, saya sarankan {preferred}. "
+          "Mau saya catat yang itu, atau kakak mau pilih salah satu dulu?"
+    )
+
+
+def _reply_price_objection(product: Dict[str, Any]) -> Dict[str, Any]:
+    name = product.get("name") or "produk ini"
+    price_text = _sales_price(product)
+    text = _sales_text(product)
+
+    if any(k in text for k in ["clicker", "fidget", "keychain", "gantungan"]):
+        value = "karena bentuknya unik, ringan dibawa, dan bisa jadi gantungan sekaligus fidget kecil"
+    elif any(k in text for k in ["lamp", "lampu", "table lamp"]):
+        value = "karena fungsinya bukan cuma pajangan, tapi juga dekorasi yang bisa dipakai"
+    else:
+        value = "karena produknya dibuat dengan detail dan bisa disesuaikan dengan kebutuhan"
+
+    return {
+        "reply": (
+            f"Kalau dibanding hadiah kecil/custom item, {name} di {price_text} masih termasuk ringan kak.\n\n"
+            f"Nilainya ada di detailnya: {value}. "
+            "Kalau kakak cari yang lebih hemat, saya juga bisa bantu pilihkan opsi termurah dari katalog."
+        ),
+        "intent": "price_objection",
+        "confidence": "high",
+        "source": "rule_buyer_intent",
+        "handoff_required": False,
+        "session_update": {
+            "buyer_stage": "price_objection",
+            "current_product": _session_product_snapshot(product, "buyer_intent_price_objection"),
+        },
+        "product_card": _build_product_card(product),
+    }
+
+
+def _reply_discount_objection(product: Dict[str, Any]) -> Dict[str, Any]:
+    name = product.get("name") or "produk ini"
+    price_text = _sales_price(product)
+
+    return {
+        "reply": (
+            f"Untuk harga {name}, patokannya saat ini {price_text} kak.\n\n"
+            "Saya belum bisa janji diskon di chat ini supaya tidak salah info. "
+            "Kalau kakak ambil beberapa pcs atau mau sekalian cek opsi yang lebih hemat, saya bisa bantu hitungkan dulu."
+        ),
+        "intent": "discount_objection",
+        "confidence": "high",
+        "source": "rule_buyer_intent",
+        "handoff_required": False,
+        "session_update": {
+            "buyer_stage": "discount_check",
+            "current_product": _session_product_snapshot(product, "buyer_intent_discount"),
+        },
+        "product_card": _build_product_card(product),
+    }
+
+
+def _is_price_objection(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "mahal", "kemahalan", "worth", "worthed", "sepadan", "kok mahal",
+    ])
+
+
+def _is_discount_question(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "bisa kurang", "kurangin", "diskon", "disc", "nego", "negoisasi", "harga pas",
+        "boleh kurang", "potongan",
+    ])
+
+
+def _is_custom_deadline_question(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "minggu depan", "besok", "hari ini", "lusa", "urgent", "cepat", "deadline",
+        "butuh kapan", "butuh minggu", "target", "tanggal", "tgl", "sebelum",
+    ])
+
+
+def _is_quality_objection(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "takut hasil", "hasilnya jelek", "jelek", "bagus ga", "rapi ga", "mirip ga",
+        "takut gagal", "kualitas", "quality", "detailnya", "pecah", "rusak",
+    ])
+
+
+def _is_cheapest_followup(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "paling murah", "termurah", "budget hemat", "hemat aja", "murah aja",
+        "yang murah", "budget murah", "harga murah",
+    ])
 
 
 
