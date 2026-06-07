@@ -202,7 +202,45 @@ def _build_custom_brief_summary(custom_brief: Optional[Dict[str, Any]]) -> Optio
     return "\n".join(lines)
 
 
-def _build_customer_capture_reply(custom_summary: Optional[str]) -> str:
+
+def _format_rupiah_amount(value: Any) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "harga konfirmasi admin"
+    if num <= 0:
+        return "harga konfirmasi admin"
+    return "Rp" + f"{int(num):,}".replace(",", ".")
+
+
+def _build_ready_stock_order_summary(order: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(order, dict) or not order:
+        return None
+
+    name = _clean_text(order.get("name"), 160)
+    qty = order.get("quantity")
+    price = order.get("price")
+    total = order.get("total")
+    product_url = _clean_text(order.get("product_url"), 300)
+
+    if not name:
+        return None
+
+    lines = [f"- Produk: {name}"]
+
+    if qty:
+        lines.append(f"- Jumlah: {qty} pcs")
+    if price:
+        lines.append(f"- Harga satuan: {_format_rupiah_amount(price)}")
+    if total:
+        lines.append(f"- Estimasi total: {_format_rupiah_amount(total)}")
+    if product_url:
+        lines.append(f"- Link produk: {product_url}")
+
+    return "\n".join(lines)
+
+
+def _build_customer_capture_reply(custom_summary: Optional[str], ready_summary: Optional[str] = None) -> str:
     if custom_summary:
         return (
             "Terima kasih kak. Nomor WhatsApp sudah saya terima.\n\n"
@@ -211,15 +249,25 @@ def _build_customer_capture_reply(custom_summary: Optional[str]) -> str:
             "Admin SpaceCraft akan follow up untuk cek estimasi harga dan waktu pengerjaan."
         )
 
+    if ready_summary:
+        return (
+            "Terima kasih kak. Nomor WhatsApp sudah saya terima.\n\n"
+            "Saya rangkum pesanan awalnya ya:\n"
+            f"{ready_summary}\n\n"
+            "Admin SpaceCraft akan follow up untuk konfirmasi stok, ongkir, dan proses pemesanan."
+        )
+
     return (
         "Terima kasih kak. Nomor WhatsApp sudah kami terima. "
         "Admin SpaceCraft akan follow up untuk bantu cek kebutuhan dan estimasi harganya ya."
     )
 
 
-def _build_owner_need_summary(message: str, custom_summary: Optional[str]) -> str:
+def _build_owner_need_summary(message: str, custom_summary: Optional[str], ready_summary: Optional[str] = None) -> str:
     if custom_summary:
         return "Brief custom:\n" + custom_summary
+    if ready_summary:
+        return "Order ready stock:\n" + ready_summary
     return _clean_text(message, 1000) or "-"
 
 
@@ -283,9 +331,10 @@ async def process_webchat_lead(
         summary = await _conversation_summary(session_id, shop_id, message)
         session_doc = await db.sessions.find_one(
             {"session_id": session_id, "shop_id": shop_id},
-            {"_id": 0, "custom_brief": 1},
+            {"_id": 0, "custom_brief": 1, "ready_stock_order": 1},
         ) or {}
         custom_summary = _build_custom_brief_summary(session_doc.get("custom_brief"))
+        ready_summary = _build_ready_stock_order_summary(session_doc.get("ready_stock_order"))
 
         lead_doc = {
             "lead_id": lead_id,
@@ -296,8 +345,10 @@ async def process_webchat_lead(
             "customer_name": final_name,
             "customer_phone": phone,
             "customer_phone_chat_id": wa_chat_id(phone),
-            "need_summary": _build_owner_need_summary(message, custom_summary),
+            "need_summary": _build_owner_need_summary(message, custom_summary, ready_summary),
               "custom_brief_summary": custom_summary,
+              "ready_stock_order_summary": ready_summary,
+              "lead_type": "custom" if custom_summary else ("ready_stock" if ready_summary else "general"),
             "conversation_summary": summary,
             "last_message": _clean_text(message, 1000),
             "page_url": page_url,
@@ -365,7 +416,7 @@ async def process_webchat_lead(
             "lead_id": lead_id,
             "captured": True,
             "notification": notify_result,
-            "reply_override": _build_customer_capture_reply(custom_summary),
+            "reply_override": _build_customer_capture_reply(custom_summary, ready_summary),
         }
 
     if request_contact and not existing:

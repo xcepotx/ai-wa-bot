@@ -126,9 +126,10 @@ def build_rule_reply(
 
     if quantity and price and (_is_price_question(msg_norm) or _is_order_intent(msg_norm) or _looks_like_followup_price_or_order(msg_norm, quantity)):
         total = int(price * quantity)
+        session_update["ready_stock_order"] = _build_ready_stock_order(product, quantity, total)
         return {
             "reply": _sales_product_reply(product, mode="quantity_total", quantity=quantity, total=total),
-            "intent": "price_inquiry",
+            "intent": "ready_stock_order",
             "confidence": "high",
             "source": "rule_product_memory" if not matched_product else "rule_product",
             "handoff_required": False,
@@ -320,9 +321,10 @@ def _sales_product_reply(product: Dict[str, Any], mode: str = "inquiry", quantit
 
     if mode == "quantity_total" and quantity and total is not None:
         return (
-            f"Siap kak. Untuk {quantity} {name}, total sementaranya {_format_rupiah(total)}.\n\n"
-            f"{value}\n\n"
-            "Mau saya bantu teruskan sebagai pesanan, atau kakak mau cek varian lain dulu?"
+            f"Siap kak. Saya catat {name} {quantity} pcs.\n\n"
+            "Estimasi:\n"
+            f"- {name}: {price_text} x {quantity} = {_format_rupiah(total)}\n\n"
+            "Kalau mau lanjut, boleh kirim nama dan nomor WhatsApp aktif kak?"
         )
 
     if mode == "price":
@@ -375,6 +377,23 @@ def _build_product_card(product: Dict[str, Any]) -> Dict[str, Any]:
         "product_type": product.get("product_type"),
         "category": product.get("category") or product.get("category_name"),
     }
+
+
+def _build_ready_stock_order(product: Dict[str, Any], quantity: int, total: int) -> Dict[str, Any]:
+    price = _to_number(product.get("price"))
+    return {
+        "product_id": product.get("id") or product.get("product_id"),
+        "name": product.get("name") or "Produk SpaceCraft",
+        "price": price,
+        "price_label": _format_rupiah(price) if price else (product.get("price_label") or "Harga konfirmasi admin"),
+        "quantity": quantity,
+        "total": total,
+        "total_label": _format_rupiah(total) if total is not None else None,
+        "category": product.get("category") or product.get("category_name"),
+        "product_url": product.get("product_url") or product.get("url"),
+        "updated_from": "ready_stock_order",
+    }
+
 
 
 def _reply_product_list(products: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
