@@ -429,6 +429,55 @@ async def _notify_owner(lead: Dict[str, Any]) -> Dict[str, Any]:
     return _send_waha_text_lazy(wa_chat_id(owner_phone), text)
 
 
+async def _notify_owner_order_readiness(
+    lead: Dict[str, Any],
+    readiness: Dict[str, Any],
+    readiness_summary: str,
+) -> Dict[str, Any]:
+    enabled = os.environ.get("WEBCHAT_LEAD_NOTIFY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    owner_phone = os.environ.get("SPACECRAFT_OWNER_WA", "").strip()
+
+    if not enabled:
+        return {"ok": False, "skipped": True, "reason": "notification_disabled"}
+    if not owner_phone:
+        return {"ok": False, "skipped": True, "reason": "SPACECRAFT_OWNER_WA_not_set"}
+
+    lead_phone = lead.get("customer_phone") or "-"
+    lead_name = lead.get("customer_name") or "Belum disebutkan"
+    session_id = lead.get("session_id") or "-"
+    method = readiness.get("fulfillment_method") or lead.get("fulfillment_method") or "-"
+    area = readiness.get("delivery_area") or lead.get("delivery_area") or "-"
+
+    if method == "delivery":
+        method_label = "Dikirim"
+    elif method == "pickup":
+        method_label = "Pickup / ambil sendiri"
+    else:
+        method_label = method
+
+    summary = _clean_text(
+        readiness_summary
+        or lead.get("order_readiness_summary")
+        or lead.get("ready_stock_order_summary")
+        or lead.get("need_summary"),
+        1600,
+    ) or "-"
+
+    text = (
+        "📦 Update pengiriman lead Webchat SpaceCraft\n\n"
+        f"Nama: {lead_name}\n"
+        f"WA calon pembeli: {lead_phone}\n\n"
+        f"Order:\n{summary}\n\n"
+        f"Pengiriman: {method_label}\n"
+        f"Area/kota: {area}\n"
+        f"Session: {session_id}\n\n"
+        "Silakan lanjut konfirmasi ongkir dan proses order."
+    )
+
+    return _send_waha_text_lazy(wa_chat_id(owner_phone), text)
+
+
+
 async def process_webchat_lead(
     *,
     shop_id: str,
@@ -494,6 +543,41 @@ async def process_webchat_lead(
                 "lead_id": lead_id,
                 "session_id": session_id,
                 "readiness": readiness,
+            },
+            "created_at": now,
+        })
+
+        updated_lead_for_notify = dict(existing)
+        updated_lead_for_notify.update(set_fields)
+
+        readiness_notify_result = await _notify_owner_order_readiness(
+            updated_lead_for_notify,
+            readiness,
+            readiness_summary,
+        )
+        readiness_notification_status = "sent" if readiness_notify_result.get("ok") else "failed"
+
+        await db.webchat_leads.update_one(
+            {"lead_id": lead_id},
+            {
+                "$set": {
+                    "order_readiness_notification": readiness_notify_result,
+                    "order_readiness_notification_status": readiness_notification_status,
+                    "order_readiness_notified_at": now if readiness_notify_result.get("ok") else None,
+                    "updated_at": now,
+                }
+            },
+        )
+
+        await db.bot_events.insert_one({
+            "event_id": new_id("evt"),
+            "shop_id": shop_id,
+            "type": "webchat.order_readiness_notified",
+            "payload": {
+                "lead_id": lead_id,
+                "session_id": session_id,
+                "notification_status": readiness_notification_status,
+                "notify_result": readiness_notify_result,
             },
             "created_at": now,
         })
