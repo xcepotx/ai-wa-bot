@@ -52,6 +52,14 @@ def build_rule_reply(
     if recommendation:
         return recommendation
 
+    custom_brief = _reply_custom_brief_followup(
+        original_message=message,
+        msg_norm=msg_norm,
+        session_doc=session_doc,
+    )
+    if custom_brief:
+        return custom_brief
+
     if _is_payment_question(msg_norm):
         payment = _extract_payment_text(context)
         if payment:
@@ -424,6 +432,164 @@ def _reply_product_list(products: List[Dict[str, Any]], context: Dict[str, Any])
         "handoff_required": False,
         "session_update": {},
     }
+
+
+
+COLOR_TERMS = {
+    "hitam", "putih", "merah", "biru", "hijau", "kuning", "orange", "oranye",
+    "ungu", "pink", "coklat", "abu", "abu-abu", "gold", "silver", "transparan",
+    "warna", "finishing", "matte", "glossy",
+}
+
+DEADLINE_TERMS = {
+    "deadline", "kapan", "besok", "hari ini", "lusa", "minggu depan",
+    "bulan depan", "urgent", "cepat", "tanggal", "tgl", "sebelum",
+}
+
+
+def _reply_custom_brief_followup(
+    *,
+    original_message: str,
+    msg_norm: str,
+    session_doc: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not _custom_context_active(session_doc):
+        return None
+
+    if _is_product_list_question(msg_norm):
+        return None
+
+    # Let exact product questions continue to product matcher if customer switches topic.
+    if any(k in msg_norm for k in ["harga coffee", "oreo", "coffee latte", "squid clicker", "table lamp"]):
+        return None
+
+    previous = session_doc.get("custom_brief") or {}
+    brief = _merge_custom_brief(previous, original_message, msg_norm)
+
+    reply = _build_custom_brief_reply(brief, msg_norm)
+
+    return {
+        "reply": reply,
+        "intent": "custom_brief",
+        "confidence": "high",
+        "source": "rule_custom_brief",
+        "handoff_required": False,
+        "session_update": {
+            "custom_brief": brief,
+        },
+    }
+
+
+def _custom_context_active(session_doc: Dict[str, Any]) -> bool:
+    last_intent = str(session_doc.get("last_intent") or "").lower()
+    if last_intent in {"custom_request", "custom_brief"}:
+        return True
+
+    reco = session_doc.get("recommendation_context") or {}
+    needs = reco.get("needs") or []
+    if isinstance(needs, list) and "custom" in needs:
+        return True
+
+    return False
+
+
+def _merge_custom_brief(previous: Dict[str, Any], original_message: str, msg_norm: str) -> Dict[str, Any]:
+    brief = dict(previous or {})
+
+    brief["has_reference"] = bool(brief.get("has_reference")) or _detect_reference(msg_norm)
+    brief["has_idea"] = bool(brief.get("has_idea")) or _detect_idea(msg_norm)
+    brief["has_size"] = bool(brief.get("has_size")) or _detect_size(msg_norm)
+    brief["has_quantity"] = bool(brief.get("has_quantity")) or _detect_custom_quantity(msg_norm)
+    brief["has_color"] = bool(brief.get("has_color")) or _detect_color(msg_norm)
+    brief["has_deadline"] = bool(brief.get("has_deadline")) or _detect_deadline(msg_norm)
+
+    if original_message:
+        notes = brief.get("notes") or []
+        if isinstance(notes, list):
+            notes = notes[-4:]
+            notes.append(original_message[:300])
+            brief["notes"] = notes
+
+    return brief
+
+
+def _detect_reference(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "gambar", "foto", "referensi", "ref", "link", "file", "stl", "obj",
+        "model 3d", "desain", "sketsa", "contoh",
+    ])
+
+
+def _detect_idea(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in [
+        "ide", "masih ide", "baru ide", "belum ada", "belum punya",
+        "karakter", "anime", "naruto", "one piece", "luffy", "gojo",
+        "robot", "superman", "batman", "figure", "figur",
+    ])
+
+
+def _detect_size(msg_norm: str) -> bool:
+    # Only treat size as answered when there is a measurable dimension.
+    # Words like "kecil/mini/besar" are useful hints, but still need exact cm/mm later.
+    return bool(re.search(r"\b\d+(?:[.,]\d+)?\s?(cm|mm|meter|m)\b", msg_norm))
+
+
+def _detect_custom_quantity(msg_norm: str) -> bool:
+    # Quantity must have an explicit quantity unit, so size like "10 cm" is not mistaken as 10 pcs.
+    if re.search(r"\b\d+\s?(pcs|pc|buah|unit|biji|set)\b", msg_norm):
+        return True
+
+    if re.search(r"\b(satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh)\s?(pcs|pc|buah|unit|biji|set)\b", msg_norm):
+        return True
+
+    return False
+
+
+def _detect_color(msg_norm: str) -> bool:
+    return any(k in msg_norm for k in COLOR_TERMS)
+
+
+def _detect_deadline(msg_norm: str) -> bool:
+    if any(k in msg_norm for k in DEADLINE_TERMS):
+        return True
+    return bool(re.search(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", msg_norm))
+
+
+def _build_custom_brief_reply(brief: Dict[str, Any], msg_norm: str) -> str:
+    if not brief.get("has_reference") and not brief.get("has_idea"):
+        return (
+            "Boleh kak. Untuk custom karakter/model, saya bantu cek kebutuhannya dulu ya.\n\n"
+            "Kakak sudah punya gambar/file referensi, atau masih berupa ide kasar?"
+        )
+
+    # Reference is helpful, but should not block the flow.
+    # If customer already gave an idea, continue collecting core production details.
+    if not brief.get("has_size"):
+        return (
+            "Siap kak, idenya sudah kebaca.\n\n"
+            "Untuk ukuran, kira-kira mau tinggi/panjang berapa cm? Misalnya 5 cm, 10 cm, atau 15 cm."
+        )
+
+    if not brief.get("has_quantity"):
+        return (
+            "Noted kak. Untuk jumlahnya mau dibuat berapa pcs dulu?"
+        )
+
+    if not brief.get("has_color"):
+        return (
+            "Siap kak. Untuk warna/finishing, mau full color, satu warna, atau nanti dibahas dengan admin?"
+        )
+
+    if not brief.get("has_deadline"):
+        return (
+            "Oke kak, brief awalnya sudah cukup jelas.\n\n"
+            "Ada target deadline pemakaian atau tanggal butuhnya?"
+        )
+
+    return (
+        "Mantap kak, brief awalnya sudah cukup untuk dicek admin.\n\n"
+        "Boleh kirim nama dan nomor WhatsApp aktif ya, supaya admin SpaceCraft bisa bantu hitungkan estimasi dan lanjut follow-up."
+    )
 
 
 RECOMMENDATION_NEED_TERMS = {
