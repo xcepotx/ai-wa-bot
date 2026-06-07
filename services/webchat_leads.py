@@ -122,6 +122,107 @@ async def _conversation_summary(session_id: str, shop_id: str, latest_message: s
     return "\n".join(parts)[-1800:]
 
 
+
+def _strip_phone_from_text(text: str) -> str:
+    cleaned = PHONE_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-")
+    return cleaned
+
+
+def _extract_first_match(pattern: str, text: str) -> Optional[str]:
+    m = re.search(pattern, text or "", re.IGNORECASE)
+    if not m:
+        return None
+    return re.sub(r"\s+", " ", m.group(1)).strip(" .,-")
+
+
+def _brief_notes_text(custom_brief: Dict[str, Any]) -> str:
+    notes = custom_brief.get("notes") or []
+    if not isinstance(notes, list):
+        return ""
+
+    cleaned = []
+    for note in notes:
+        text = _strip_phone_from_text(str(note or ""))
+        if text:
+            cleaned.append(text)
+
+    return " | ".join(cleaned[-6:])
+
+
+def _build_custom_brief_summary(custom_brief: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(custom_brief, dict) or not custom_brief:
+        return None
+
+    notes_text = _brief_notes_text(custom_brief)
+    if not notes_text:
+        return None
+
+    idea = _extract_first_match(
+        r"(?:mau|buat|bikin|request|custom)\s+(.+?)(?:\s+(?:tinggi|ukuran|panjang|lebar|sekitar|\d+\s?(?:cm|mm)|\d+\s?(?:pcs|pc|buah|unit|set)|warna|deadline|tgl|tanggal)|$)",
+        notes_text,
+    )
+    if not idea:
+        idea = _extract_first_match(r"(karakter\s+[^|,.;]+)", notes_text)
+
+    if idea:
+        idea = re.sub(r"\s*\|.*$", "", idea).strip(" .,-|")
+
+    size = _extract_first_match(
+        r"((?:tinggi|ukuran|panjang|lebar)?\s*(?:sekitar\s*)?\d+(?:[.,]\d+)?\s?(?:cm|mm|meter|m))",
+        notes_text,
+    )
+    qty = _extract_first_match(r"(\d+\s?(?:pcs|pc|buah|unit|biji|set))", notes_text)
+    color = _extract_first_match(r"(?:warna|finishing)\s+([A-Za-zÀ-ÿ0-9\s\-]{3,40})", notes_text)
+    deadline = _extract_first_match(r"(?:deadline|butuh|sebelum|tanggal|tgl)\s+([^|,.;]+)", notes_text)
+
+    if color:
+        color = re.sub(r"\b(deadline|butuh|sebelum|tanggal|tgl).*$", "", color, flags=re.IGNORECASE).strip(" .,-")
+    if deadline:
+        deadline = deadline.strip(" .,-")
+
+    lines = []
+    if idea:
+        lines.append(f"- Kebutuhan: {idea}")
+    elif custom_brief.get("has_idea"):
+        lines.append("- Kebutuhan: custom karakter/model")
+
+    if size:
+        lines.append(f"- Ukuran: {size}")
+    if qty:
+        lines.append(f"- Jumlah: {qty}")
+    if color:
+        lines.append(f"- Warna/finishing: {color}")
+    if deadline:
+        lines.append(f"- Deadline: {deadline}")
+
+    if not lines:
+        return None
+
+    return "\n".join(lines)
+
+
+def _build_customer_capture_reply(custom_summary: Optional[str]) -> str:
+    if custom_summary:
+        return (
+            "Terima kasih kak. Nomor WhatsApp sudah saya terima.\n\n"
+            "Saya rangkum brief awalnya ya:\n"
+            f"{custom_summary}\n\n"
+            "Admin SpaceCraft akan follow up untuk cek estimasi harga dan waktu pengerjaan."
+        )
+
+    return (
+        "Terima kasih kak. Nomor WhatsApp sudah kami terima. "
+        "Admin SpaceCraft akan follow up untuk bantu cek kebutuhan dan estimasi harganya ya."
+    )
+
+
+def _build_owner_need_summary(message: str, custom_summary: Optional[str]) -> str:
+    if custom_summary:
+        return "Brief custom:\n" + custom_summary
+    return _clean_text(message, 1000) or "-"
+
+
 async def _notify_owner(lead: Dict[str, Any]) -> Dict[str, Any]:
     enabled = os.environ.get("WEBCHAT_LEAD_NOTIFY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     owner_phone = os.environ.get("SPACECRAFT_OWNER_WA", "").strip()
@@ -180,6 +281,11 @@ async def process_webchat_lead(
         final_name = detected_name or (customer_name if customer_name != "Website Visitor" else None)
 
         summary = await _conversation_summary(session_id, shop_id, message)
+        session_doc = await db.sessions.find_one(
+            {"session_id": session_id, "shop_id": shop_id},
+            {"_id": 0, "custom_brief": 1},
+        ) or {}
+        custom_summary = _build_custom_brief_summary(session_doc.get("custom_brief"))
 
         lead_doc = {
             "lead_id": lead_id,
@@ -190,7 +296,8 @@ async def process_webchat_lead(
             "customer_name": final_name,
             "customer_phone": phone,
             "customer_phone_chat_id": wa_chat_id(phone),
-            "need_summary": _clean_text(message, 1000),
+            "need_summary": _build_owner_need_summary(message, custom_summary),
+              "custom_brief_summary": custom_summary,
             "conversation_summary": summary,
             "last_message": _clean_text(message, 1000),
             "page_url": page_url,
@@ -258,10 +365,7 @@ async def process_webchat_lead(
             "lead_id": lead_id,
             "captured": True,
             "notification": notify_result,
-            "reply_override": (
-                "Terima kasih kak. Nomor WhatsApp sudah kami terima. "
-                "Admin SpaceCraft akan follow up untuk bantu cek kebutuhan dan estimasi harganya ya."
-            ),
+            "reply_override": _build_customer_capture_reply(custom_summary),
         }
 
     if request_contact and not existing:
