@@ -109,10 +109,7 @@ def build_rule_reply(
     if quantity and price and (_is_price_question(msg_norm) or _is_order_intent(msg_norm) or _looks_like_followup_price_or_order(msg_norm, quantity)):
         total = int(price * quantity)
         return {
-            "reply": (
-                f"Untuk {quantity} {product_name}, total sementaranya "
-                f"{_format_rupiah(total)} kak. Mau saya bantu teruskan pesanan ini ke owner?"
-            ),
+            "reply": _sales_product_reply(product, mode="quantity_total", quantity=quantity, total=total),
             "intent": "price_inquiry",
             "confidence": "high",
             "source": "rule_product_memory" if not matched_product else "rule_product",
@@ -123,7 +120,7 @@ def build_rule_reply(
 
     if _is_price_question(msg_norm) and price:
         return {
-            "reply": f"{product_name} harganya {_format_rupiah(price)} kak. Mau pesan berapa?",
+            "reply": _sales_product_reply(product, mode="price"),
             "intent": "price_inquiry",
             "confidence": "high",
             "source": "rule_product",
@@ -161,9 +158,9 @@ def build_rule_reply(
 
     if _is_order_intent(msg_norm):
         if price:
-            reply = f"Siap kak, mau pesan {product_name} ya. Harganya {_format_rupiah(price)}. Mau berapa?"
+            reply = _sales_product_reply(product, mode="order")
         else:
-            reply = f"Siap kak, mau pesan {product_name} ya. Untuk harga/detailnya saya bantu konfirmasi ke owner."
+            reply = _sales_product_reply(product, mode="order")
         return {
             "reply": reply,
             "intent": "order_intent",
@@ -176,7 +173,7 @@ def build_rule_reply(
 
     if price:
         return {
-            "reply": f"{product_name} tersedia di katalog dengan harga {_format_rupiah(price)} kak. Mau pesan berapa?",
+            "reply": _sales_product_reply(product, mode="inquiry"),
             "intent": "product_inquiry",
             "confidence": "high" if match_score >= 0.5 else "medium",
             "source": "rule_product",
@@ -186,7 +183,7 @@ def build_rule_reply(
         }
 
     return {
-        "reply": f"{product_name} ada di katalog kak. Untuk detail harga/stok, saya bantu konfirmasi ke owner ya.",
+        "reply": _sales_product_reply(product, mode="inquiry"),
         "intent": "product_inquiry",
         "confidence": "medium",
         "source": "rule_product",
@@ -196,6 +193,152 @@ def build_rule_reply(
     }
 
 
+
+
+
+def _sales_clean(value: Any, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return ""
+
+    if len(text) <= limit:
+        return text
+
+    cut = text[:limit].rstrip()
+
+    # Prefer ending at a complete sentence if available.
+    sentence_end = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if sentence_end >= 80:
+        cut = cut[:sentence_end + 1].strip()
+    else:
+        # Otherwise cut at the last safe word boundary.
+        last_space = cut.rfind(" ")
+        if last_space >= 80:
+            cut = cut[:last_space].strip()
+
+        # Avoid dangling connector words at the end.
+        cut = re.sub(r"\b(atau|dan|untuk|dengan|pada|di|ke|yang|agar|sebagai)$", "", cut, flags=re.IGNORECASE).strip(" ,.-")
+
+        if not cut.endswith((".", "!", "?")):
+            cut += "..."
+
+    return cut
+
+def _sales_price(product: Dict[str, Any]) -> str:
+    price = _to_number(product.get("price"))
+    label = _sales_clean(product.get("price_label"), 80)
+    if price:
+        return _format_rupiah(price)
+    return label or "harga perlu dikonfirmasi admin"
+
+
+def _sales_text(product: Dict[str, Any]) -> str:
+    parts = [
+        product.get("name"),
+        product.get("category"),
+        product.get("category_name"),
+        product.get("product_type"),
+    ]
+    return _normalize(" ".join(str(x) for x in parts if x))
+
+def _sales_value(product: Dict[str, Any]) -> str:
+    desc = _sales_clean(product.get("short_description") or product.get("description"), 150)
+    if desc:
+        return f"Detail singkatnya: {desc}"
+
+    text = _sales_text(product)
+    if any(k in text for k in ["clicker", "fidget", "keychain", "gantungan"]):
+        return "Produk ini cocok untuk fidget kecil, gantungan tas/kunci, atau hadiah lucu yang ringan."
+    if any(k in text for k in ["lamp", "lampu", "table lamp"]):
+        return "Produk ini cocok untuk dekorasi meja, hadiah unik, atau item display yang lebih standout."
+    if _sales_is_custom_product(product):
+        return "Ini cocok kalau kakak punya ide, referensi, atau model tertentu yang ingin dibuatkan."
+    if any(k in text for k in ["gift", "souvenir", "hadiah", "kado"]):
+        return "Produk ini cocok untuk hadiah personal, souvenir kecil, atau kebutuhan custom gift."
+    return "Saya bisa bantu arahkan pilihan yang paling cocok sesuai kebutuhan kakak."
+
+def _sales_is_custom_product(product: Dict[str, Any]) -> bool:
+    name = _normalize(product.get("name"))
+    category = _normalize(product.get("category") or product.get("category_name"))
+    product_type = _normalize(product.get("product_type"))
+
+    strong_text = " ".join([name, category, product_type])
+
+    if any(k in name for k in ["custom 3d print", "custom gift", "custom souvenir"]):
+        return True
+    if product_type in {"preorder_print", "custom", "custom_print", "made_to_order"}:
+        return True
+    if any(k in category for k in ["custom-3d", "custom 3d", "custom-print", "custom print"]):
+        return True
+    if "custom" in strong_text and not any(k in strong_text for k in ["clicker", "keychain", "gantungan", "fidget"]):
+        return True
+
+    return False
+
+def _sales_followup(product: Dict[str, Any], mode: str = "inquiry") -> str:
+    text = _sales_text(product)
+
+    # Specific ready-stock product types must win over generic "custom" keywords.
+    if any(k in text for k in ["clicker", "fidget", "keychain", "gantungan"]):
+        return "Kakak mau saya bantu bandingkan dengan varian clicker lain, atau mau lanjut lihat detail produk ini?"
+
+    if any(k in text for k in ["lamp", "lampu", "table lamp"]):
+        return "Kakak mau dipakai untuk dekorasi sendiri atau untuk hadiah?"
+
+    if _sales_is_custom_product(product):
+        return "Kakak sudah punya file/desain, atau masih berupa gambar referensi?"
+
+    if mode == "order":
+        return "Kakak mau ambil berapa pcs?"
+
+    return "Kakak mau saya bantu pilihkan opsi yang paling cocok, atau mau lanjut ke produk ini?"
+
+def _sales_product_reply(product: Dict[str, Any], mode: str = "inquiry", quantity: Optional[int] = None, total: Optional[int] = None) -> str:
+    name = product.get("name") or "produk tersebut"
+    price = _to_number(product.get("price"))
+    price_text = _sales_price(product)
+    value = _sales_value(product)
+    followup = _sales_followup(product, mode)
+
+    if mode == "quantity_total" and quantity and total is not None:
+        return (
+            f"Siap kak. Untuk {quantity} {name}, total sementaranya {_format_rupiah(total)}.\n\n"
+            f"{value}\n\n"
+            "Mau saya bantu teruskan sebagai pesanan, atau kakak mau cek varian lain dulu?"
+        )
+
+    if mode == "price":
+        return f"{name} harganya {price_text} kak.\n\n{value}\n\n{followup}"
+
+    if mode == "order":
+        if price:
+            return f"Siap kak, {name} bisa dibantu. Harganya {price_text}.\n\n{value}\n\n{followup}"
+        return f"Siap kak, {name} bisa dibantu. Untuk harga/detail paling akurat, saya bantu konfirmasi ke owner ya.\n\n{value}\n\n{followup}"
+
+    if price:
+        return f"Ada kak, {name} tersedia di katalog. Harganya {price_text}.\n\n{value}\n\n{followup}"
+
+    return f"Ada kak, {name} masuk katalog. Untuk harga/detail paling akurat, saya bantu konfirmasi ke owner ya.\n\n{value}\n\n{followup}"
+
+
+def _sales_group_key(product: Dict[str, Any]) -> str:
+    text = _sales_text(product)
+
+    # Put concrete ready-stock products first, so clickers/keychains do not get swallowed by generic custom keywords.
+    if any(k in text for k in ["clicker", "fidget", "keychain", "gantungan"]):
+        return "clicker"
+    if any(k in text for k in ["lamp", "lampu", "table lamp"]):
+        return "lamp"
+    if _sales_is_custom_product(product):
+        return "custom"
+    if any(k in text for k in ["gift", "souvenir", "hadiah", "kado"]):
+        return "gift"
+    return "ready"
+
+def _sales_chip(product: Dict[str, Any]) -> str:
+    name = product.get("name") or "Produk"
+    price = _to_number(product.get("price"))
+    return f"{name} ({_format_rupiah(price)})" if price else name
 
 
 def _build_product_card(product: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,30 +373,47 @@ def _reply_product_list(products: List[Dict[str, Any]], context: Dict[str, Any])
         }
 
     shop_name = _extract_shop_name(context)
+    prefix = f"Siap kak. Di {shop_name}, produknya bisa saya bantu pilihkan berdasarkan kebutuhan:" if shop_name else "Siap kak. Produknya bisa saya bantu pilihkan berdasarkan kebutuhan:"
+
+    labels = {
+        "custom": "Custom 3D print",
+        "gift": "Gift & souvenir",
+        "lamp": "Table lamp/dekorasi",
+        "clicker": "Clicker/keychain lucu",
+        "ready": "Produk ready stock",
+    }
+    order = ["custom", "gift", "lamp", "clicker", "ready"]
+    grouped = {key: [] for key in order}
+
+    for product in active:
+        grouped.setdefault(_sales_group_key(product), []).append(product)
+
     lines = []
+    for key in order:
+        items = grouped.get(key) or []
+        if not items:
+            continue
+        examples = ", ".join(_sales_chip(x) for x in items[:2])
+        if len(items) > 2:
+            examples += f", dan {len(items) - 2} lainnya"
+        lines.append(f"- {labels.get(key, 'Produk')}: {examples}")
 
-    for idx, product in enumerate(active[:8], 1):
-        name = product.get("name") or f"Produk {idx}"
-        price = _to_number(product.get("price"))
-        if price:
-            lines.append(f"{idx}. {name} - {_format_rupiah(price)}")
-        else:
-            lines.append(f"{idx}. {name}")
+    if not lines:
+        examples = ", ".join(_sales_chip(x) for x in active[:4])
+        if len(active) > 4:
+            examples += f", dan {len(active) - 4} lainnya"
+        lines = [f"- Produk tersedia: {examples}"]
 
-    more = ""
-    if len(active) > 8:
-        more = f"\n\nMasih ada {len(active) - 8} produk lain kak."
+    closing = "Kakak lagi cari untuk hadiah, koleksi pribadi, fidget/keychain, table lamp, atau mau custom model tertentu?"
 
-    prefix = f"Menu/produk di {shop_name}:" if shop_name else "Menu/produk yang tersedia:"
     return {
-        "reply": f"{prefix}\n" + "\n".join(lines) + more + "\n\nMau pesan yang mana kak?",
+        "reply": prefix + "\n" + "\n".join(lines[:5]) + "\n\n" + closing,
         "intent": "product_list",
         "confidence": "high",
         "source": "rule_product_list",
         "handoff_required": False,
         "session_update": {},
     }
-
 
 def _extract_products(context: Dict[str, Any]) -> List[Dict[str, Any]]:
     candidates: List[Any] = []
