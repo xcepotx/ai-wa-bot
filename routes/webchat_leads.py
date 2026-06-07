@@ -41,6 +41,7 @@ async def _get_user_shop_id(user: dict) -> str:
 async def list_webchat_leads(
     request: Request,
     status: Optional[str] = Query(None),
+    lead_type: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=100),
     skip: int = Query(0, ge=0),
@@ -49,18 +50,56 @@ async def list_webchat_leads(
     shop_id = await _get_user_shop_id(user)
 
     query = {"shop_id": shop_id, "source": "webchat"}
+    conditions = []
 
     if status:
         query["status"] = status
 
+    lead_type = (lead_type or "").strip().lower()
+    if lead_type:
+        if lead_type == "ready_stock":
+            conditions.append({
+                "$or": [
+                    {"lead_type": "ready_stock"},
+                    {"ready_stock_order_summary": {"$nin": [None, ""]}},
+                    {"need_summary": {"$regex": "^Order ready stock", "$options": "i"}},
+                ]
+            })
+        elif lead_type == "custom":
+            conditions.append({
+                "$or": [
+                    {"lead_type": "custom"},
+                    {"custom_brief_summary": {"$nin": [None, ""]}},
+                    {"need_summary": {"$regex": "^Brief custom", "$options": "i"}},
+                ]
+            })
+        elif lead_type == "general":
+            conditions.append({
+                "$and": [
+                    {"lead_type": {"$in": [None, "", "general"]}},
+                    {"custom_brief_summary": {"$in": [None, ""]}},
+                    {"ready_stock_order_summary": {"$in": [None, ""]}},
+                ]
+            })
+        else:
+            raise HTTPException(status_code=400, detail="Tipe lead tidak valid")
+
     if q:
-        query["$or"] = [
-            {"customer_name": {"$regex": q, "$options": "i"}},
-            {"customer_phone": {"$regex": q, "$options": "i"}},
-            {"need_summary": {"$regex": q, "$options": "i"}},
-            {"conversation_summary": {"$regex": q, "$options": "i"}},
-            {"session_id": {"$regex": q, "$options": "i"}},
-        ]
+        conditions.append({
+            "$or": [
+                {"customer_name": {"$regex": q, "$options": "i"}},
+                {"customer_phone": {"$regex": q, "$options": "i"}},
+                {"need_summary": {"$regex": q, "$options": "i"}},
+                {"custom_brief_summary": {"$regex": q, "$options": "i"}},
+                {"ready_stock_order_summary": {"$regex": q, "$options": "i"}},
+                {"conversation_summary": {"$regex": q, "$options": "i"}},
+                {"session_id": {"$regex": q, "$options": "i"}},
+                {"lead_type": {"$regex": q, "$options": "i"}},
+            ]
+        })
+
+    if conditions:
+        query["$and"] = conditions
 
     total = await db.webchat_leads.count_documents(query)
     items = await db.webchat_leads.find(query, {"_id": 0}) \
@@ -69,11 +108,40 @@ async def list_webchat_leads(
         .limit(limit) \
         .to_list(limit)
 
+    base_match = {"shop_id": shop_id, "source": "webchat"}
+
     status_rows = await db.webchat_leads.aggregate([
-        {"$match": {"shop_id": shop_id, "source": "webchat"}},
+        {"$match": base_match},
         {"$group": {"_id": "$status", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
     ]).to_list(50)
+
+    type_rows = await db.webchat_leads.aggregate([
+        {"$match": base_match},
+        {"$project": {
+            "lead_type_resolved": {
+                "$cond": [
+                    {"$ne": [{"$ifNull": ["$lead_type", ""]}, ""]},
+                    "$lead_type",
+                    {
+                        "$cond": [
+                            {"$ne": [{"$ifNull": ["$ready_stock_order_summary", ""]}, ""]},
+                            "ready_stock",
+                            {
+                                "$cond": [
+                                    {"$ne": [{"$ifNull": ["$custom_brief_summary", ""]}, ""]},
+                                    "custom",
+                                    "general",
+                                ]
+                            },
+                        ]
+                    },
+                ]
+            }
+        }},
+        {"$group": {"_id": "$lead_type_resolved", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+    ]).to_list(20)
 
     return {
         "items": items,
@@ -83,6 +151,10 @@ async def list_webchat_leads(
         "status_counts": [
             {"status": row.get("_id") or "unknown", "count": row.get("count", 0)}
             for row in status_rows
+        ],
+        "type_counts": [
+            {"lead_type": row.get("_id") or "general", "count": row.get("count", 0)}
+            for row in type_rows
         ],
     }
 
