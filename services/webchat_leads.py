@@ -264,6 +264,103 @@ def _build_ready_stock_order_summary(order: Optional[Dict[str, Any]]) -> Optiona
     return "\n".join(lines)
 
 
+
+def _is_ready_stock_lead(lead: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(lead, dict):
+        return False
+    return (
+        lead.get("lead_type") == "ready_stock"
+        or bool(lead.get("ready_stock_order_summary"))
+        or "Order ready stock" in str(lead.get("need_summary") or "")
+    )
+
+
+def _extract_order_readiness(message: str) -> Optional[Dict[str, Any]]:
+    text = _strip_phone_from_text(message or "")
+    if not text:
+        return None
+
+    lower = text.lower()
+
+    if any(k in lower for k in ["pickup", "ambil sendiri", "diambil sendiri", "ambil ke toko", "ambil di toko"]):
+        return {
+            "fulfillment_method": "pickup",
+            "delivery_area": None,
+            "raw_text": text[:300],
+        }
+
+    delivery_markers = ["dikirim", "kirim", "kirimin", "antar", "ongkir", "alamat", "tujuan"]
+    if not any(k in lower for k in delivery_markers):
+        return None
+
+    patterns = [
+        r"(?:dikirim|kirim|kirimin|antar)\s+(?:ke\s+)?(.{3,120})",
+        r"(?:ongkir|alamat|tujuan)\s+(?:ke\s+)?(.{3,120})",
+    ]
+
+    area = None
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            area = m.group(1)
+            break
+
+    if area:
+        area = re.sub(r"\b(kak|ka|ya|dong|aja|saja|admin|nanti|tolong)\b.*$", "", area, flags=re.IGNORECASE)
+        area = re.sub(r"\s+", " ", area).strip(" .,-")
+        if len(area) < 3:
+            area = None
+
+    return {
+        "fulfillment_method": "delivery",
+        "delivery_area": area,
+        "raw_text": text[:300],
+    }
+
+
+def _build_order_readiness_summary(lead: Dict[str, Any], readiness: Dict[str, Any]) -> str:
+    lines = []
+    ready_summary = _clean_text(lead.get("ready_stock_order_summary"), 1200)
+    if ready_summary:
+        lines.append(ready_summary)
+
+    method = readiness.get("fulfillment_method")
+    area = readiness.get("delivery_area")
+
+    if method == "pickup":
+        lines.append("- Pengiriman: Pickup / ambil sendiri")
+    elif method == "delivery":
+        lines.append("- Pengiriman: Dikirim")
+        if area:
+            lines.append(f"- Area/kota pengiriman: {area}")
+        else:
+            lines.append("- Area/kota pengiriman: perlu dikonfirmasi")
+
+    return "\n".join(lines).strip()
+
+
+def _build_order_readiness_reply(readiness: Dict[str, Any]) -> str:
+    method = readiness.get("fulfillment_method")
+    area = readiness.get("delivery_area")
+
+    if method == "pickup":
+        return (
+            "Siap kak, saya catat opsinya pickup / ambil sendiri.\n\n"
+            "Nanti admin konfirmasi titik pickup dan jadwal yang paling aman ya."
+        )
+
+    if area:
+        return (
+            f"Siap kak, saya catat area pengirimannya ke {area}.\n\n"
+            "Untuk ongkir dan estimasi kirimnya nanti admin bantu konfirmasi dulu supaya tidak salah hitung."
+        )
+
+    return (
+        "Siap kak, saya catat pesanan ini untuk dikirim.\n\n"
+        "Boleh info kota/area pengirimannya juga kak? Nanti admin bantu konfirmasi ongkir supaya tidak salah hitung."
+    )
+
+
 def _build_customer_capture_reply(custom_summary: Optional[str], ready_summary: Optional[str] = None) -> str:
     if custom_summary:
         return (
@@ -278,7 +375,8 @@ def _build_customer_capture_reply(custom_summary: Optional[str], ready_summary: 
             "Terima kasih kak. Nomor WhatsApp sudah saya terima.\n\n"
             "Saya rangkum pesanan awalnya ya:\n"
             f"{ready_summary}\n\n"
-            "Admin SpaceCraft akan follow up untuk konfirmasi stok, ongkir, dan proses pemesanan."
+            "Sambil menunggu admin, boleh info kota/area pengiriman kak? "
+            "Nanti admin bantu konfirmasi stok dan ongkir supaya tidak salah hitung."
         )
 
     return (
@@ -355,6 +453,58 @@ async def process_webchat_lead(
         },
         {"_id": 0},
     )
+
+    readiness = _extract_order_readiness(message)
+    if existing and not phone and _is_ready_stock_lead(existing) and readiness:
+        lead_id = existing.get("lead_id")
+        readiness_summary = _build_order_readiness_summary(existing, readiness)
+
+        set_fields = {
+            "order_readiness": readiness,
+            "order_readiness_summary": readiness_summary,
+            "fulfillment_method": readiness.get("fulfillment_method"),
+            "delivery_area": readiness.get("delivery_area"),
+            "updated_at": now,
+        }
+
+        await db.webchat_leads.update_one(
+            {"lead_id": lead_id},
+            {"$set": set_fields},
+        )
+
+        await db.sessions.update_one(
+            {"session_id": session_id, "shop_id": shop_id},
+            {
+                "$set": {
+                    "order_readiness": readiness,
+                    "order_readiness_summary": readiness_summary,
+                    "fulfillment_method": readiness.get("fulfillment_method"),
+                    "delivery_area": readiness.get("delivery_area"),
+                    "buyer_stage": "order_readiness_collected",
+                    "updated_at": now,
+                }
+            },
+        )
+
+        await db.bot_events.insert_one({
+            "event_id": new_id("evt"),
+            "shop_id": shop_id,
+            "type": "webchat.order_readiness_updated",
+            "payload": {
+                "lead_id": lead_id,
+                "session_id": session_id,
+                "readiness": readiness,
+            },
+            "created_at": now,
+        })
+
+        return {
+            "lead_id": lead_id,
+            "captured": False,
+            "contact_requested": False,
+            "readiness_updated": True,
+            "reply_override": _build_order_readiness_reply(readiness),
+        }
 
     if phone:
         lead_id = existing.get("lead_id") if existing else new_id("lead")
